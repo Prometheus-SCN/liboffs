@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <cstring>
 #include <string>
+#include <vector>
 #include <fstream>
 extern "C" {
 #include "../src/ClientAPI/Unix/unix_transport.h"
@@ -9,7 +10,9 @@ extern "C" {
 #include "../src/BlockCache/block_cache.h"
 #include "../src/BlockCache/block.h"
 #include "../src/OFFStreams/ofd_cache.h"
+#include "../src/OFFStreams/off_url.h"
 #include "../src/OFFStreams/tuple_cache.h"
+#include "../src/Buffer/buffer.h"
 #include "../src/Scheduler/scheduler.h"
 #include "../src/Configuration/config.h"
 #include "../src/Network/authority.h"
@@ -17,6 +20,7 @@ extern "C" {
 #include "../src/Node/node.h"
 #include "../src/Timer/timer_actor.h"
 #include "../src/Util/rm_rf.h"
+#include "../src/Util/base58.h"
 #include "../src/Platform/platform.h"
 #include "../src/Platform/platform_posix_compat.h"
 #include <string.h>
@@ -385,6 +389,482 @@ TEST_F(TestUnixTransport, PutAndGetRoundTrip) {
     platform_socket_destroy(sock);
 }
 
+TEST_F(TestUnixTransport, LoadRoundTrip) {
+    platform_socket_t* sock = _connect_with_retry(socket_path);
+    ASSERT_NE(sock, (platform_socket_t*)NULL);
+
+    /* 150000 bytes spans two 128000-byte standard blocks -> 2 tuples. */
+    const size_t data_size = 150000;
+    std::vector<uint8_t> data(data_size);
+    for (size_t index = 0; index < data_size; index++) {
+        data[index] = (uint8_t)(index & 0xFF);
+    }
+
+    client_api_put_request_t put_req;
+    memset(&put_req, 0, sizeof(put_req));
+    put_req.content_type = (char*)"application/octet-stream";
+    put_req.file_name = (char*)"load_roundtrip.bin";
+    put_req.stream_length = data_size;
+    put_req.server_address = NULL;
+    put_req.data = data.data();
+    put_req.data_size = data_size;
+
+    cbor_item_t* frame = client_api_put_request_encode(&put_req);
+    ASSERT_NE(frame, nullptr);
+    ASSERT_EQ(_send_frame(sock, frame), 0);
+
+    stream_framer_t* framer = stream_framer_create();
+    cbor_item_t* response = _recv_frame(sock, framer);
+    ASSERT_NE(response, nullptr);
+
+    uint8_t type = client_api_wire_get_type(response);
+    ASSERT_EQ(type, CLIENT_API_PUT_RESPONSE);
+
+    client_api_put_response_t put_resp;
+    memset(&put_resp, 0, sizeof(put_resp));
+    ASSERT_EQ(client_api_put_response_decode(response, &put_resp), 0);
+    ASSERT_NE(put_resp.ori_string, nullptr);
+    char* ori_string = strdup(put_resp.ori_string);
+    client_api_put_response_destroy(&put_resp);
+    cbor_decref(&response);
+
+    /* Flip the socket nonblocking so _recv_frame's attempt loop (not a
+     * blocking recv) bounds each LOAD frame wait — keeps the test from
+     * stalling indefinitely when the server sends fewer frames than
+     * expected. The large PUT send above already completed while blocking. */
+    platform_socket_set_nonblocking(sock);
+
+    client_api_load_request_t load_req;
+    memset(&load_req, 0, sizeof(load_req));
+    load_req.ori_string = ori_string;
+    load_req.has_range = 0;
+
+    frame = client_api_load_request_encode(&load_req);
+    ASSERT_NE(frame, nullptr);
+    ASSERT_EQ(_send_frame(sock, frame), 0);
+    free(ori_string);
+
+    /* Read frames until LOAD_END, counting progress frames. */
+    size_t progress_frames = 0;
+    size_t last_loaded = 0;
+    uint8_t end_status = 0xFF;
+    size_t end_loaded = 0;
+    size_t end_total = 0;
+
+    for (int index = 0; index < 16; index++) {
+        response = _recv_frame(sock, framer, 2000);
+        if (response == nullptr) {
+            break;
+        }
+        type = client_api_wire_get_type(response);
+        if (type == CLIENT_API_LOAD_PROGRESS) {
+            size_t loaded = 0;
+            size_t total = 0;
+            EXPECT_EQ(client_api_load_progress_decode(response, &loaded, &total), 0);
+            EXPECT_EQ(total, (size_t)2);
+            EXPECT_GT(loaded, last_loaded);
+            last_loaded = loaded;
+            progress_frames++;
+        } else if (type == CLIENT_API_LOAD_END) {
+            EXPECT_EQ(client_api_load_end_decode(response, &end_status, &end_loaded, &end_total), 0);
+            EXPECT_EQ(end_status, CLIENT_API_LOAD_STATUS_LOADED);
+            EXPECT_EQ(end_loaded, (size_t)2);
+            EXPECT_EQ(end_total, (size_t)2);
+            cbor_decref(&response);
+            break;
+        }
+        cbor_decref(&response);
+    }
+
+    /* Exactly-once terminal: after the LOAD_END, drain a few more frames with
+     * a short timeout and assert no second LOAD_END arrives. */
+    for (int index = 0; index < 4; index++) {
+        cbor_item_t* extra = _recv_frame(sock, framer, 300);
+        if (extra != nullptr) {
+            EXPECT_NE(client_api_wire_get_type(extra), CLIENT_API_LOAD_END)
+                << "LOAD_END must be sent exactly once per LOAD request";
+            cbor_decref(&extra);
+        }
+    }
+
+    /* Close the client connection before asserting so a failure path cannot
+     * stall transport teardown with a live socket. */
+    stream_framer_destroy(framer);
+    platform_socket_destroy(sock);
+
+    EXPECT_EQ(progress_frames, (size_t)2);
+    EXPECT_EQ(last_loaded, (size_t)2);
+    EXPECT_EQ(end_status, CLIENT_API_LOAD_STATUS_LOADED);
+    EXPECT_EQ(end_loaded, (size_t)2);
+    EXPECT_EQ(end_total, (size_t)2);
+}
+
+/* PUT a 3-tuple file on one transport, DELETE one of the file's data blocks
+ * from the block cache, then LOAD the same ORI on a SECOND transport with a
+ * fresh tuple cache. Two transports are required for a true partial state:
+ * the PUT path seeds the tuple cache with the assembled tuples
+ * (writeable_off_stream.c:123), so a LOAD on the same tuple cache resolves
+ * every tuple without ever touching a block. On the second transport any
+ * hash that is not the descriptor block belongs to exactly one tuple, so the
+ * damaged tuple must be skipped and tallied: LOAD_END must arrive with
+ * PARTIAL status and loaded == 2 of total == 3. This is the terminal frame
+ * that could never fire before the pipeline-driven completion fix — a
+ * skipped tuple never renders and never advances the stream's sent_bytes, so
+ * the render path could not close the stream and the client hung with no
+ * LOAD_END at all. */
+TEST_F(TestUnixTransport, LoadPartialSkipsMissingTuples) {
+    char partial_path[128];
+    _make_socket_path(partial_path, sizeof(partial_path), "partial");
+    platform_local_cleanup(partial_path);
+
+    tuple_cache_t* partial_tc = tuple_cache_create(100, pool);
+    unix_transport_t* partial = unix_transport_create(
+        pool, bc, ofd_cache, partial_tc, partial_path, NULL, NULL);
+    ASSERT_NE(partial, nullptr);
+    unix_transport_start(partial);
+
+    platform_socket_t* sock = _connect_with_retry(partial_path);
+    ASSERT_NE(sock, (platform_socket_t*)NULL);
+
+    /* 384000 bytes spans three 128000-byte standard blocks -> 3 tuples. */
+    const size_t data_size = 384000;
+    std::vector<uint8_t> data(data_size);
+    for (size_t index = 0; index < data_size; index++) {
+        data[index] = (uint8_t)((index * 7) & 0xFF);
+    }
+
+    client_api_put_request_t put_req;
+    memset(&put_req, 0, sizeof(put_req));
+    put_req.content_type = (char*)"application/octet-stream";
+    put_req.file_name = (char*)"load_partial.bin";
+    put_req.stream_length = data_size;
+    put_req.server_address = NULL;
+    put_req.data = data.data();
+    put_req.data_size = data_size;
+
+    cbor_item_t* frame = client_api_put_request_encode(&put_req);
+    ASSERT_NE(frame, nullptr);
+    ASSERT_EQ(_send_frame(sock, frame), 0);
+
+    stream_framer_t* framer = stream_framer_create();
+    cbor_item_t* response = _recv_frame(sock, framer);
+    ASSERT_NE(response, nullptr);
+    ASSERT_EQ(client_api_wire_get_type(response), CLIENT_API_PUT_RESPONSE);
+
+    client_api_put_response_t put_resp;
+    memset(&put_resp, 0, sizeof(put_resp));
+    ASSERT_EQ(client_api_put_response_decode(response, &put_resp), 0);
+    ASSERT_NE(put_resp.ori_string, nullptr);
+    char* ori_string = strdup(put_resp.ori_string);
+    client_api_put_response_destroy(&put_resp);
+    cbor_decref(&response);
+
+    /* Corrupt the block cache: remove one stored block that is not the
+     * descriptor block. The PUT response proves every block of the file is
+     * stored, so the index must contain at least ten entries (nine data
+     * blocks for the three tuples + the descriptor). */
+    off_url_t* url = off_url_parse(ori_string);
+    ASSERT_NE(url, nullptr);
+    ASSERT_NE(url->descriptor_hash, nullptr);
+    /* The PUT response is emitted when the descriptor closes, but the store
+     * actor's payload-block index inserts can still be in flight on the
+     * pool: drain it and rescan the index (bounded retries) until a
+     * non-descriptor entry shows up. */
+    buffer_t* victim_copy = NULL;
+    for (int attempt = 0; attempt < 50 && victim_copy == NULL; attempt++) {
+        scheduler_pool_wait_for_idle(pool);
+        index_entry_vec_t* entries = index_to_array(bc->index);
+        ASSERT_NE(entries, nullptr);
+        buffer_t* victim_hash = NULL;
+        for (int index = 0; index < entries->length; index++) {
+            index_entry_t* entry = entries->data[index];
+            if (buffer_compare(entry->hash, url->descriptor_hash) != 0) {
+                victim_hash = entry->hash;
+                break;
+            }
+        }
+        if (victim_hash != NULL) {
+            /* Copy the victim hash before the removal releases the entry's
+             * storage. */
+            victim_copy = buffer_copy(victim_hash);
+            ASSERT_NE(victim_copy, nullptr);
+        } else {
+            platform_sleep_ms(20);
+        }
+        vec_deinit(entries);
+        free(entries);
+    }
+    ASSERT_NE(victim_copy, nullptr) << "no data block found in the cache index";
+    block_cache_remove(bc, victim_copy, NULL);
+    off_url_destroy(url);
+    scheduler_pool_wait_for_idle(pool);
+
+    /* Close the PUT-side connection: the LOAD runs on a second transport so
+     * its cold tuple cache forces the load through the block cache, where the
+     * victim block is now missing. */
+    stream_framer_destroy(framer);
+    platform_socket_destroy(sock);
+    framer = stream_framer_create();
+
+    char load_path[128];
+    _make_socket_path(load_path, sizeof(load_path), "partial_load");
+    platform_local_cleanup(load_path);
+
+    tuple_cache_t* load_tc = tuple_cache_create(100, pool);
+    unix_transport_t* load_transport = unix_transport_create(
+        pool, bc, ofd_cache, load_tc, load_path, NULL, NULL);
+    ASSERT_NE(load_transport, nullptr);
+    unix_transport_start(load_transport);
+
+    sock = _connect_with_retry(load_path);
+    ASSERT_NE(sock, (platform_socket_t*)NULL);
+    platform_socket_set_nonblocking(sock);
+
+    client_api_load_request_t load_req;
+    memset(&load_req, 0, sizeof(load_req));
+    load_req.ori_string = ori_string;
+    load_req.has_range = 0;
+
+    frame = client_api_load_request_encode(&load_req);
+    ASSERT_NE(frame, nullptr);
+    ASSERT_EQ(_send_frame(sock, frame), 0);
+    free(ori_string);
+    ori_string = NULL;
+
+    /* Read frames until LOAD_END. Three progress frames are expected (one
+     * per resolved tuple, loaded or skipped); the delete victim's tuple is
+     * skipped, so the frame sequence order depends on which tuple was hit —
+     * only the counts are asserted. */
+    size_t progress_frames = 0;
+    uint8_t end_status = 0xFF;
+    size_t end_loaded = 0;
+    size_t end_total = 0;
+    bool saw_load_end = false;
+
+    for (int index = 0; index < 16; index++) {
+        response = _recv_frame(sock, framer, 2000);
+        if (response == nullptr) {
+            break;
+        }
+        uint8_t type = client_api_wire_get_type(response);
+        if (type == CLIENT_API_LOAD_PROGRESS) {
+            size_t loaded = 0;
+            size_t total = 0;
+            EXPECT_EQ(client_api_load_progress_decode(response, &loaded, &total), 0);
+            EXPECT_EQ(total, (size_t)3);
+            EXPECT_LE(loaded, (size_t)2);
+            progress_frames++;
+        } else if (type == CLIENT_API_LOAD_END) {
+            EXPECT_EQ(client_api_load_end_decode(response, &end_status, &end_loaded, &end_total), 0);
+            saw_load_end = true;
+            cbor_decref(&response);
+            break;
+        }
+        cbor_decref(&response);
+    }
+
+    /* Exactly-once terminal: drain a few more frames with a short timeout;
+     * none may be a second LOAD_END. */
+    for (int index = 0; index < 4; index++) {
+        cbor_item_t* extra = _recv_frame(sock, framer, 300);
+        if (extra != nullptr) {
+            EXPECT_NE(client_api_wire_get_type(extra), CLIENT_API_LOAD_END);
+            cbor_decref(&extra);
+        }
+    }
+
+    /* Close the client connection before asserting so a failure path cannot
+     * stall transport teardown with a live socket. */
+    stream_framer_destroy(framer);
+    platform_socket_destroy(sock);
+
+    EXPECT_TRUE(saw_load_end)
+        << "partial load never terminated: LOAD_END missing after the tally completed";
+    EXPECT_EQ(progress_frames, (size_t)3);
+    EXPECT_EQ(end_status, CLIENT_API_LOAD_STATUS_PARTIAL);
+    EXPECT_EQ(end_loaded, (size_t)2);
+    EXPECT_EQ(end_total, (size_t)3);
+    DESTROY(victim_copy, buffer);
+
+    unix_transport_stop(load_transport);
+    unix_transport_destroy(load_transport);
+    tuple_cache_destroy(load_tc);
+    platform_local_cleanup(load_path);
+
+    unix_transport_stop(partial);
+    unix_transport_destroy(partial);
+    tuple_cache_destroy(partial_tc);
+    platform_local_cleanup(partial_path);
+}
+
+/* Directory ORIs are rejected at the unix LOAD handler before any pipeline is
+   built, so the client gets exactly one ERROR frame with BAD_REQUEST and the
+   explicit directory message — and no LOAD_PROGRESS/LOAD_END tail afterward.
+   The ORI uses real base58-encoded hashes so off_url_parse succeeds and the
+   directory check (not the parse fallback "Invalid OFF URL") is what rejects. */
+TEST_F(TestUnixTransport, LoadDirectoryOriRejected) {
+    platform_socket_t* sock = _connect_with_retry(socket_path);
+    ASSERT_NE(sock, (platform_socket_t*)NULL);
+
+    uint8_t file_hash_bytes[32];
+    uint8_t descriptor_hash_bytes[32];
+    for (size_t index = 0; index < sizeof(file_hash_bytes); index++) {
+        file_hash_bytes[index] = (uint8_t)(index + 1);
+        descriptor_hash_bytes[index] = (uint8_t)(0xA0 + index);
+    }
+    char file_hash_b58[64];
+    char descriptor_hash_b58[64];
+    /* base58_encode does not null-terminate; the caller owns the terminator. */
+    int file_hash_len = base58_encode(file_hash_bytes, sizeof(file_hash_bytes),
+                                      file_hash_b58, sizeof(file_hash_b58));
+    ASSERT_GT(file_hash_len, 0);
+    file_hash_b58[file_hash_len] = '\0';
+    int descriptor_hash_len = base58_encode(descriptor_hash_bytes,
+                                            sizeof(descriptor_hash_bytes),
+                                            descriptor_hash_b58,
+                                            sizeof(descriptor_hash_b58));
+    ASSERT_GT(descriptor_hash_len, 0);
+    descriptor_hash_b58[descriptor_hash_len] = '\0';
+
+    char directory_ori[512];
+    snprintf(directory_ori, sizeof(directory_ori),
+             "http://localhost:23402/offsystem/v3/offsystem/directory/%zu/%s/%s/dir_test.bin",
+             (size_t)4096, file_hash_b58, descriptor_hash_b58);
+
+    client_api_load_request_t load_req;
+    memset(&load_req, 0, sizeof(load_req));
+    load_req.ori_string = directory_ori;
+    load_req.has_range = 0;
+
+    cbor_item_t* frame = client_api_load_request_encode(&load_req);
+    ASSERT_NE(frame, nullptr);
+    ASSERT_EQ(_send_frame(sock, frame), 0);
+
+    /* Nonblocking so the drain loop below is bounded by timeouts. */
+    platform_socket_set_nonblocking(sock);
+
+    stream_framer_t* framer = stream_framer_create();
+    cbor_item_t* response = _recv_frame(sock, framer);
+    ASSERT_NE(response, nullptr);
+
+    uint8_t type = client_api_wire_get_type(response);
+    EXPECT_EQ(type, CLIENT_API_ERROR);
+    if (type == CLIENT_API_ERROR) {
+        client_api_error_t err;
+        memset(&err, 0, sizeof(err));
+        int decode_result = client_api_error_decode(response, &err);
+        EXPECT_EQ(decode_result, 0);
+        if (decode_result == 0) {
+            EXPECT_EQ(err.status_code, CLIENT_API_STATUS_BAD_REQUEST);
+            ASSERT_NE(err.message, nullptr);
+            EXPECT_STREQ(err.message, "Load requires a file ORI, not a directory");
+            client_api_error_destroy(&err);
+        }
+    }
+    cbor_decref(&response);
+
+    /* Rejection fires before any pipeline exists: no load frames follow. */
+    for (int index = 0; index < 4; index++) {
+        cbor_item_t* extra = _recv_frame(sock, framer, 300);
+        if (extra != nullptr) {
+            uint8_t extra_type = client_api_wire_get_type(extra);
+            EXPECT_NE(extra_type, CLIENT_API_LOAD_PROGRESS)
+                << "directory ORI must not enter the load pipeline";
+            EXPECT_NE(extra_type, CLIENT_API_LOAD_END)
+                << "directory ORI must not reach the load pipeline";
+            cbor_decref(&extra);
+        }
+    }
+
+    stream_framer_destroy(framer);
+    platform_socket_destroy(sock);
+}
+
+/* A LOAD whose descriptor hash decodes (valid base58, 32 bytes) but is not
+   in the block cache (and no network is configured) must fail cleanly: the
+   descriptor's error_event fires, the pipeline deactivates rs and desc, and
+   the client receives exactly one terminal LOAD_END with STATUS_FAILED (2)
+   and zero progress frames. Without the deactivate-loop guard in
+   _unix_load_on_desc_error/_unix_load_on_rs_error this path re-notifies
+   error_event forever (stream_deactivate notifies unconditionally), so the
+   terminal frame — and the finite drain below — is the regression pin. */
+TEST_F(TestUnixTransport, LoadFailedWhenDescriptorUnreachable) {
+    platform_socket_t* sock = _connect_with_retry(socket_path);
+    ASSERT_NE(sock, (platform_socket_t*)NULL);
+    platform_socket_set_nonblocking(sock);
+
+    /* base58 of bytes 0x01..0x20 — exactly how the positive tests derive
+       hashes; decodes to a valid 32-byte hash that is absent from the cache. */
+    uint8_t hash_bytes[32];
+    for (size_t index = 0; index < sizeof(hash_bytes); index++) {
+        hash_bytes[index] = (uint8_t)(index + 1);
+    }
+    char hash_b58[64];
+    ASSERT_GT(base58_encode(hash_bytes, sizeof(hash_bytes),
+                            hash_b58, sizeof(hash_b58)), 0);
+
+    char ghost_ori[512];
+    snprintf(ghost_ori, sizeof(ghost_ori),
+             "http://localhost:23402/offsystem/v3/standard/%zu/%s/%s/load_ghost.bin",
+             (size_t)100, hash_b58, hash_b58);
+
+    client_api_load_request_t load_req;
+    memset(&load_req, 0, sizeof(load_req));
+    load_req.ori_string = ghost_ori;
+    load_req.has_range = 0;
+
+    cbor_item_t* frame = client_api_load_request_encode(&load_req);
+    ASSERT_NE(frame, nullptr);
+    ASSERT_EQ(_send_frame(sock, frame), 0);
+
+    stream_framer_t* framer = stream_framer_create();
+    size_t progress_frames = 0;
+    uint8_t end_status = 0xFF;
+    size_t end_loaded = 0;
+    size_t end_total = 0;
+    bool saw_load_end = false;
+
+    for (int index = 0; index < 16; index++) {
+        cbor_item_t* response = _recv_frame(sock, framer, 10000);
+        if (response == nullptr) {
+            break;
+        }
+        uint8_t type = client_api_wire_get_type(response);
+        if (type == CLIENT_API_LOAD_PROGRESS) {
+            progress_frames++;
+        } else if (type == CLIENT_API_LOAD_END) {
+            EXPECT_EQ(client_api_load_end_decode(response, &end_status,
+                                                &end_loaded, &end_total), 0);
+            saw_load_end = true;
+            cbor_decref(&response);
+            break;
+        }
+        cbor_decref(&response);
+    }
+
+    /* Exactly-once terminal: drain a few more frames with a short timeout;
+     * none may be a second LOAD_END (or any further load traffic — the loop
+     * guard keeps the failure path finite). */
+    for (int index = 0; index < 4; index++) {
+        cbor_item_t* extra = _recv_frame(sock, framer, 300);
+        if (extra != nullptr) {
+            EXPECT_NE(client_api_wire_get_type(extra), CLIENT_API_LOAD_END);
+            cbor_decref(&extra);
+        }
+    }
+
+    /* Close the client connection before asserting so a failure path cannot
+     * stall transport teardown with a live socket. */
+    stream_framer_destroy(framer);
+    platform_socket_destroy(sock);
+
+    EXPECT_TRUE(saw_load_end)
+        << "unreachable-descriptor load never terminated: LOAD_END missing";
+    EXPECT_EQ(end_status, CLIENT_API_LOAD_STATUS_FAILED);
+    EXPECT_EQ(end_loaded, (size_t)0);
+    EXPECT_EQ(progress_frames, (size_t)0);
+}
+
 TEST_F(TestUnixTransport, MaxConnections) {
     char limited_path[128];
     _make_socket_path(limited_path, sizeof(limited_path), "limited");
@@ -511,6 +991,50 @@ static void _assert_peer_frame_unauthorized(platform_socket_t* sock, cbor_item_t
     stream_framer_destroy(framer);
 }
 
+/* Same gate as peer frames: the reply must be exactly one ERROR frame with
+ * the auth-required message, and no follow-up frames may arrive. */
+static void _assert_load_frame_unauthorized(platform_socket_t* sock, cbor_item_t* frame) {
+    ASSERT_NE(frame, nullptr);
+    ASSERT_EQ(_send_frame(sock, frame), 0);
+
+    stream_framer_t* framer = stream_framer_create();
+    cbor_item_t* response = _recv_frame(sock, framer);
+    ASSERT_NE(response, nullptr);
+
+    uint8_t type = client_api_wire_get_type(response);
+    EXPECT_EQ(type, CLIENT_API_ERROR);
+    if (type == CLIENT_API_ERROR) {
+        client_api_error_t err;
+        memset(&err, 0, sizeof(err));
+        int decode_result = client_api_error_decode(response, &err);
+        EXPECT_EQ(decode_result, 0);
+        if (decode_result == 0) {
+            EXPECT_EQ(err.status_code, CLIENT_API_STATUS_UNAUTHORIZED);
+            ASSERT_NE(err.message, nullptr);
+            EXPECT_STREQ(err.message, "Authentication required");
+            client_api_error_destroy(&err);
+        }
+    }
+    cbor_decref(&response);
+
+    /* Nonblocking so the drain loop below is bounded by the recv timeout
+       (the error reply has already been consumed above). */
+    platform_socket_set_nonblocking(sock);
+
+    /* The handler rejected the frame before building any pipeline: no load
+       frames ever follow the error. */
+    for (int index = 0; index < 4; index++) {
+        cbor_item_t* extra = _recv_frame(sock, framer, 300);
+        if (extra != nullptr) {
+            uint8_t extra_type = client_api_wire_get_type(extra);
+            EXPECT_NE(extra_type, CLIENT_API_LOAD_PROGRESS);
+            EXPECT_NE(extra_type, CLIENT_API_LOAD_END);
+            cbor_decref(&extra);
+        }
+    }
+    stream_framer_destroy(framer);
+}
+
 class TestUnixTransportPeerRouting : public testing::Test {
 protected:
     scheduler_pool_t* pool;
@@ -597,6 +1121,23 @@ TEST_F(TestUnixTransportPeerRouting, FriendListRequestRoutedToHandler) {
     platform_socket_t* sock = _connect_with_retry(socket_path);
     ASSERT_NE(sock, (platform_socket_t*)NULL);
     _assert_peer_frame_unauthorized(sock, client_api_friend_list_request_encode());
+    platform_socket_destroy(sock);
+}
+
+/* An unauthenticated LOAD_REQUEST is rejected at the handler's auth gate
+ * (same posture as peer/friend frames) before any ORI parsing. */
+TEST_F(TestUnixTransportPeerRouting, LoadRequestUnauthorized) {
+    platform_socket_t* sock = _connect_with_retry(socket_path);
+    ASSERT_NE(sock, (platform_socket_t*)NULL);
+
+    client_api_load_request_t load_req;
+    memset(&load_req, 0, sizeof(load_req));
+    load_req.ori_string = (char*)"http://localhost:23402/offsystem/v3/"
+                                 "application/octet-stream/1/z/z/file.bin";
+    load_req.has_range = 0;
+    cbor_item_t* frame = client_api_load_request_encode(&load_req);
+    ASSERT_NE(frame, nullptr);
+    _assert_load_frame_unauthorized(sock, frame);
     platform_socket_destroy(sock);
 }
 

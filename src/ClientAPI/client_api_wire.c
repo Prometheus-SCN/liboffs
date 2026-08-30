@@ -9,6 +9,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* PPM QR images are large: a version-40 QR at 4x scale is a ~740x740 P6
+   PPM (~1.6 MB) for a 2331-byte payload. 2 MB covers the worst case while
+   still bounding allocation. */
+#define CLIENT_API_PEER_INFO_MAX_PAYLOAD (2 * 1024 * 1024)
+
 // --- Helper: encode a string as CBOR text string (empty string for NULL) ---
 static cbor_item_t* _encode_string(const char* str) {
   if (str == NULL) {
@@ -563,7 +568,215 @@ int client_api_get_end_decode(cbor_item_t* item) {
   return type == CLIENT_API_GET_END ? 0 : -1;
 }
 
-// --- Error ---
+// --- Load Request ---
+// [type, ori_string] or [type, ori_string, has_range, range_start, range_end]
+
+cbor_item_t* client_api_load_request_encode(const client_api_load_request_t* msg) {
+  cbor_item_t* array;
+  cbor_item_t* item;
+
+  if (msg->has_range) {
+    array = cbor_new_definite_array(5);
+  } else {
+    array = cbor_new_definite_array(2);
+  }
+
+  item = cbor_build_uint8(CLIENT_API_LOAD_REQUEST);
+  (void)cbor_array_push(array, item);
+  cbor_decref(&item);
+
+  item = _encode_string(msg->ori_string);
+  (void)cbor_array_push(array, item);
+  cbor_decref(&item);
+
+  if (msg->has_range) {
+    item = cbor_build_uint8(1);
+    (void)cbor_array_push(array, item);
+    cbor_decref(&item);
+
+    item = cbor_build_uint64(msg->range_start);
+    (void)cbor_array_push(array, item);
+    cbor_decref(&item);
+
+    item = cbor_build_uint64(msg->range_end);
+    (void)cbor_array_push(array, item);
+    cbor_decref(&item);
+  }
+
+  return array;
+}
+
+int client_api_load_request_decode(cbor_item_t* item, client_api_load_request_t* msg) {
+  if (!cbor_isa_array(item) || cbor_array_size(item) < 2) return -1;
+  memset(msg, 0, sizeof(*msg));
+
+  cbor_item_t* type_item = cbor_array_get(item, 0);
+  if (!cbor_isa_uint(type_item) || cbor_get_uint8(type_item) != CLIENT_API_LOAD_REQUEST) {
+    cbor_decref(&type_item);
+    return -1;
+  }
+  cbor_decref(&type_item);
+
+  cbor_item_t* ori = cbor_array_get(item, 1);
+  msg->ori_string = _decode_string(ori, OFFS_MAX_ORI_STRING_LEN);
+  cbor_decref(&ori);
+
+  if (validate_ori_string(msg->ori_string) != 0) {
+    free(msg->ori_string);
+    msg->ori_string = NULL;
+    return -1;
+  }
+
+  /* The 5-element ranged shape mirrors GET_REQUEST: a literal 1 flag in
+     position 2, then the range bounds. has_range is derived from the array
+     shape alone, not from decoding the flag element. */
+  if (cbor_array_size(item) >= 5) {
+    cbor_item_t* range_start = cbor_array_get(item, 3);
+    if (!cbor_isa_uint(range_start)) {
+      cbor_decref(&range_start);
+      client_api_load_request_destroy(msg);
+      memset(msg, 0, sizeof(*msg));
+      return -1;
+    }
+    msg->range_start = _decode_size(range_start);
+    cbor_decref(&range_start);
+
+    cbor_item_t* range_end = cbor_array_get(item, 4);
+    if (!cbor_isa_uint(range_end)) {
+      cbor_decref(&range_end);
+      client_api_load_request_destroy(msg);
+      memset(msg, 0, sizeof(*msg));
+      return -1;
+    }
+    msg->range_end = _decode_size(range_end);
+    cbor_decref(&range_end);
+
+    msg->has_range = 1;
+  }
+
+  return 0;
+}
+
+void client_api_load_request_destroy(client_api_load_request_t* msg) {
+  if (msg == NULL) return;
+  free(msg->ori_string);
+  msg->ori_string = NULL;
+}
+
+// --- Load Progress ---
+// [type, tuples_loaded: uint, tuples_total: uint]
+
+cbor_item_t* client_api_load_progress_encode(size_t tuples_loaded, size_t tuples_total) {
+  cbor_item_t* array = cbor_new_definite_array(3);
+  cbor_item_t* item;
+
+  item = cbor_build_uint8(CLIENT_API_LOAD_PROGRESS);
+  (void)cbor_array_push(array, item);
+  cbor_decref(&item);
+
+  item = cbor_build_uint64(tuples_loaded);
+  (void)cbor_array_push(array, item);
+  cbor_decref(&item);
+
+  item = cbor_build_uint64(tuples_total);
+  (void)cbor_array_push(array, item);
+  cbor_decref(&item);
+
+  return array;
+}
+
+int client_api_load_progress_decode(cbor_item_t* item, size_t* tuples_loaded, size_t* tuples_total) {
+  if (!cbor_isa_array(item) || cbor_array_size(item) < 3) return -1;
+
+  cbor_item_t* type_item = cbor_array_get(item, 0);
+  if (!cbor_isa_uint(type_item) || cbor_get_uint8(type_item) != CLIENT_API_LOAD_PROGRESS) {
+    cbor_decref(&type_item);
+    return -1;
+  }
+  cbor_decref(&type_item);
+
+  cbor_item_t* loaded_item = cbor_array_get(item, 1);
+  if (!cbor_isa_uint(loaded_item)) {
+    cbor_decref(&loaded_item);
+    return -1;
+  }
+  *tuples_loaded = _decode_size(loaded_item);
+  cbor_decref(&loaded_item);
+
+  cbor_item_t* total_item = cbor_array_get(item, 2);
+  if (!cbor_isa_uint(total_item)) {
+    cbor_decref(&total_item);
+    return -1;
+  }
+  *tuples_total = _decode_size(total_item);
+  cbor_decref(&total_item);
+
+  return 0;
+}
+
+// --- Load End ---
+// [type, status: uint, tuples_loaded: uint, tuples_total: uint]
+// status: 0 = loaded, 1 = partial (some tuples skipped), 2 = failed
+
+cbor_item_t* client_api_load_end_encode(uint8_t status, size_t tuples_loaded, size_t tuples_total) {
+  cbor_item_t* array = cbor_new_definite_array(4);
+  cbor_item_t* item;
+
+  item = cbor_build_uint8(CLIENT_API_LOAD_END);
+  (void)cbor_array_push(array, item);
+  cbor_decref(&item);
+
+  item = cbor_build_uint8(status);
+  (void)cbor_array_push(array, item);
+  cbor_decref(&item);
+
+  item = cbor_build_uint64(tuples_loaded);
+  (void)cbor_array_push(array, item);
+  cbor_decref(&item);
+
+  item = cbor_build_uint64(tuples_total);
+  (void)cbor_array_push(array, item);
+  cbor_decref(&item);
+
+  return array;
+}
+
+int client_api_load_end_decode(cbor_item_t* item, uint8_t* status, size_t* tuples_loaded, size_t* tuples_total) {
+  if (!cbor_isa_array(item) || cbor_array_size(item) < 4) return -1;
+
+  cbor_item_t* type_item = cbor_array_get(item, 0);
+  if (!cbor_isa_uint(type_item) || cbor_get_uint8(type_item) != CLIENT_API_LOAD_END) {
+    cbor_decref(&type_item);
+    return -1;
+  }
+  cbor_decref(&type_item);
+
+  cbor_item_t* status_item = cbor_array_get(item, 1);
+  if (!cbor_isa_uint(status_item)) {
+    cbor_decref(&status_item);
+    return -1;
+  }
+  *status = cbor_get_uint8(status_item);
+  cbor_decref(&status_item);
+
+  cbor_item_t* loaded_item = cbor_array_get(item, 2);
+  if (!cbor_isa_uint(loaded_item)) {
+    cbor_decref(&loaded_item);
+    return -1;
+  }
+  *tuples_loaded = _decode_size(loaded_item);
+  cbor_decref(&loaded_item);
+
+  cbor_item_t* total_item = cbor_array_get(item, 3);
+  if (!cbor_isa_uint(total_item)) {
+    cbor_decref(&total_item);
+    return -1;
+  }
+  *tuples_total = _decode_size(total_item);
+  cbor_decref(&total_item);
+
+  return 0;
+}
 // [type, status_code, message_string]
 
 cbor_item_t* client_api_error_encode(const client_api_error_t* msg) {
@@ -1072,14 +1285,52 @@ void client_api_update_status_response_destroy(client_api_update_status_response
 }
 
 // --- Peer Info Request ---
-// [type] — no payload
+// [type] or [type, format: uint]
 
 cbor_item_t* client_api_peer_info_request_encode(void) {
-  cbor_item_t* array = cbor_new_definite_array(1);
+  return client_api_peer_info_request_encode_format(0);
+}
+
+cbor_item_t* client_api_peer_info_request_encode_format(uint8_t format) {
+  if (format > 2) return NULL;  /* only 0/1/2 are defined; decode rejects the rest */
+  /* Format 0 keeps the original 1-element frame shape so old daemons and
+     old capture tooling see byte-identical requests. */
+  cbor_item_t* array = cbor_new_definite_array(format == 0 ? 1 : 2);
   cbor_item_t* item = cbor_build_uint8(CLIENT_API_PEER_INFO_REQUEST);
   (void)cbor_array_push(array, item);
   cbor_decref(&item);
+  if (format != 0) {
+    item = cbor_build_uint8(format);
+    (void)cbor_array_push(array, item);
+    cbor_decref(&item);
+  }
   return array;
+}
+
+int client_api_peer_info_request_decode(cbor_item_t* item, uint8_t* format) {
+  if (item == NULL || format == NULL || !cbor_isa_array(item)) return -1;
+  size_t size = cbor_array_size(item);
+  if (size < 1 || size > 2) return -1;
+
+  cbor_item_t* type_item = cbor_array_get(item, 0);
+  if (!cbor_isa_uint(type_item) ||
+      cbor_get_uint8(type_item) != CLIENT_API_PEER_INFO_REQUEST) {
+    cbor_decref(&type_item);
+    return -1;
+  }
+  cbor_decref(&type_item);
+
+  *format = 0;  /* bare [type] frame means raw CBOR */
+  if (size == 2) {
+    cbor_item_t* format_item = cbor_array_get(item, 1);
+    if (!cbor_isa_uint(format_item) || cbor_get_uint8(format_item) > 2) {
+      cbor_decref(&format_item);
+      return -1;
+    }
+    *format = cbor_get_uint8(format_item);
+    cbor_decref(&format_item);
+  }
+  return 0;
 }
 
 // --- Peer Info Response ---
@@ -1129,7 +1380,7 @@ int client_api_peer_info_response_decode(cbor_item_t* item, client_api_peer_info
     return -1;
   }
   msg->data_size = cbor_bytestring_length(data_item);
-  if (msg->data_size > 65536) {
+  if (msg->data_size > CLIENT_API_PEER_INFO_MAX_PAYLOAD) {
     cbor_decref(&data_item);
     return -1;
   }
@@ -1194,7 +1445,9 @@ int client_api_peer_connect_decode(cbor_item_t* item, client_api_peer_connect_t*
     return -1;
   }
   msg->data_size = cbor_bytestring_length(data_item);
-  if (msg->data_size > 65536) {
+  /* format 2 carries a PPM QR image, which is larger than raw peer info —
+     see peer_info_response cap */
+  if (msg->data_size > CLIENT_API_PEER_INFO_MAX_PAYLOAD) {
     cbor_decref(&data_item);
     return -1;
   }
@@ -1356,7 +1609,9 @@ int client_api_friend_add_decode(cbor_item_t* item, client_api_friend_add_t* msg
     return -1;
   }
   msg->data_size = cbor_bytestring_length(data_item);
-  if (msg->data_size > 65536) {
+  /* format 2 carries a PPM QR image, which is larger than raw peer info —
+     see peer_info_response cap */
+  if (msg->data_size > CLIENT_API_PEER_INFO_MAX_PAYLOAD) {
     cbor_decref(&data_item);
     return -1;
   }

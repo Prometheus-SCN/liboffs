@@ -164,6 +164,14 @@ struct offs_client_t {
   void* block_delete_cb_ctx;
   offs_health_cb_t health_cb;
   void* health_cb_ctx;
+  offs_peer_info_cb_t peer_info_cb;
+  void* peer_info_cb_ctx;
+  offs_peer_connect_cb_t peer_connect_cb;
+  void* peer_connect_cb_ctx;
+  offs_load_progress_cb_t load_progress_cb;
+  void* load_progress_cb_ctx;
+  offs_load_end_cb_t load_end_cb;
+  void* load_end_cb_ctx;
 };
 
 /* Forward declaration — needed for MsQuic callbacks that call _handle_frame */
@@ -510,6 +518,14 @@ static void _handle_frame(offs_client_t* client, uint8_t type, cbor_item_t* fram
   void* block_delete_cb_ctx = client->block_delete_cb_ctx;
   offs_health_cb_t health_cb = client->health_cb;
   void* health_cb_ctx = client->health_cb_ctx;
+  offs_peer_info_cb_t peer_info_cb = client->peer_info_cb;
+  void* peer_info_cb_ctx = client->peer_info_cb_ctx;
+  offs_peer_connect_cb_t peer_connect_cb = client->peer_connect_cb;
+  void* peer_connect_cb_ctx = client->peer_connect_cb_ctx;
+  offs_load_progress_cb_t load_progress_cb = client->load_progress_cb;
+  void* load_progress_cb_ctx = client->load_progress_cb_ctx;
+  offs_load_end_cb_t load_end_cb = client->load_end_cb;
+  void* load_end_cb_ctx = client->load_end_cb_ctx;
   platform_mutex_unlock(client->lock);
 
   switch (type) {
@@ -596,6 +612,46 @@ static void _handle_frame(offs_client_t* client, uint8_t type, cbor_item_t* fram
           health_cb(health_cb_ctx, msg.json_data);
         }
         client_api_health_response_destroy(&msg);
+      }
+      break;
+    }
+    case CLIENT_API_PEER_INFO_RESPONSE: {
+      client_api_peer_info_response_t msg;
+      memset(&msg, 0, sizeof(msg));
+      if (client_api_peer_info_response_decode(frame, &msg) == 0) {
+        if (peer_info_cb != NULL) {
+          peer_info_cb(peer_info_cb_ctx, msg.format, msg.data, msg.data_size);
+        }
+        client_api_peer_info_response_destroy(&msg);
+      }
+      break;
+    }
+    case CLIENT_API_PEER_CONNECT_RESULT: {
+      client_api_peer_connect_result_t msg;
+      memset(&msg, 0, sizeof(msg));
+      if (client_api_peer_connect_result_decode(frame, &msg) == 0) {
+        if (peer_connect_cb != NULL) {
+          peer_connect_cb(peer_connect_cb_ctx, msg.status);
+        }
+        client_api_peer_connect_result_destroy(&msg);
+      }
+      break;
+    }
+    case CLIENT_API_LOAD_PROGRESS: {
+      size_t tuples_loaded = 0, tuples_total = 0;
+      if (client_api_load_progress_decode(frame, &tuples_loaded, &tuples_total) == 0) {
+        if (load_progress_cb != NULL) {
+          load_progress_cb(load_progress_cb_ctx, tuples_loaded, tuples_total);
+        }
+      }
+      break;
+    }
+    case CLIENT_API_LOAD_END: {
+      uint8_t status = 0; size_t loaded = 0, total = 0;
+      if (client_api_load_end_decode(frame, &status, &loaded, &total) == 0) {
+        if (load_end_cb != NULL) {
+          load_end_cb(load_end_cb_ctx, status, loaded, total);
+        }
       }
       break;
     }
@@ -1095,7 +1151,7 @@ static offs_client_t* _connect_attempt(const char* transport_url, const char* ap
   } else if (strncmp(transport_url, "tcp://", 6) == 0) {
     const char* addr = transport_url + 6;
     char* host = get_memory(strlen(addr) + 1);
-    strcpy(host, addr);
+    memcpy(host, addr, strlen(addr) + 1);
     char* colon = strrchr(host, ':');
     if (colon == NULL) {
       free(host);
@@ -1121,7 +1177,7 @@ static offs_client_t* _connect_attempt(const char* transport_url, const char* ap
     uint8_t is_ssl = (transport_url[4] == 's');
     const char* addr_start = is_ssl ? transport_url + 6 : transport_url + 5;
     char* addr_copy = get_memory(strlen(addr_start) + 1);
-    strcpy(addr_copy, addr_start);
+    memcpy(addr_copy, addr_start, strlen(addr_start) + 1);
     /* Extract path (everything after first /) */
     char* path_start = strchr(addr_copy, '/');
     if (path_start != NULL) {
@@ -1220,7 +1276,7 @@ static offs_client_t* _connect_attempt(const char* transport_url, const char* ap
     uint8_t is_secure = (transport_url[4] == 's');
     const char* addr_start = is_secure ? transport_url + 6 : transport_url + 5;
     char* addr_copy = get_memory(strlen(addr_start) + 1);
-    strcpy(addr_copy, addr_start);
+    memcpy(addr_copy, addr_start, strlen(addr_start) + 1);
 
     /* Extract host and port */
     char* colon = strrchr(addr_copy, ':');
@@ -1850,6 +1906,117 @@ int offs_client_health(offs_client_t* client,
   platform_mutex_unlock(client->lock);
 
   cbor_item_t* frame = client_api_health_request_encode();
+  _send_frame(client, frame);
+  return 0;
+}
+
+int offs_client_peer_info_ex(offs_client_t* client, uint8_t format,
+                             offs_peer_info_cb_t callback, void* ctx) {
+  if (client == NULL || !client->connected) return -1;
+
+  cbor_item_t* frame = client_api_peer_info_request_encode_format(format);
+  if (frame == NULL) return -1;  /* invalid format (> 2) rejected by encoder */
+
+  platform_mutex_lock(client->lock);
+  client->peer_info_cb = callback;
+  client->peer_info_cb_ctx = ctx;
+  platform_mutex_unlock(client->lock);
+
+  _send_frame(client, frame);
+  return 0;
+}
+
+int offs_client_peer_info(offs_client_t* client,
+                          offs_peer_info_cb_t callback, void* ctx) {
+  return offs_client_peer_info_ex(client, 0, callback, ctx);
+}
+
+int offs_client_peer_info_qr(offs_client_t* client,
+                             offs_peer_info_cb_t callback, void* ctx) {
+  return offs_client_peer_info_ex(client, 2, callback, ctx);
+}
+
+int offs_client_peer_connect(offs_client_t* client, uint8_t format,
+                             const uint8_t* data, size_t data_len,
+                             offs_peer_connect_cb_t callback, void* ctx) {
+  if (client == NULL || !client->connected || data == NULL || data_len == 0) return -1;
+  if (format > 2) return -1;  /* only 0/1/2 are defined */
+
+  client_api_peer_connect_t msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.format = format;
+  msg.data = (uint8_t*)data;
+  msg.data_size = data_len;
+
+  cbor_item_t* frame = client_api_peer_connect_encode(&msg);
+  if (frame == NULL) return -1;  /* cbor allocation failure */
+
+  platform_mutex_lock(client->lock);
+  client->peer_connect_cb = callback;
+  client->peer_connect_cb_ctx = ctx;
+  platform_mutex_unlock(client->lock);
+
+  _send_frame(client, frame);
+  return 0;
+}
+
+int offs_client_peer_connect_qr(offs_client_t* client, const uint8_t* ppm, size_t ppm_len,
+                                offs_peer_connect_cb_t callback, void* ctx) {
+  return offs_client_peer_connect(client, 2, ppm, ppm_len, callback, ctx);
+}
+
+int offs_client_friend_add(offs_client_t* client, uint8_t format,
+                           const uint8_t* data, size_t data_len,
+                           offs_peer_connect_cb_t callback, void* ctx) {
+  if (client == NULL || !client->connected || data == NULL || data_len == 0) return -1;
+  if (format > 2) return -1;  /* only 0/1/2 are defined */
+
+  client_api_friend_add_t msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.format = format;
+  msg.data = (uint8_t*)data;
+  msg.data_size = data_len;
+
+  cbor_item_t* frame = client_api_friend_add_encode(&msg);
+  if (frame == NULL) return -1;  /* cbor allocation failure */
+
+  platform_mutex_lock(client->lock);
+  client->peer_connect_cb = callback;
+  client->peer_connect_cb_ctx = ctx;
+  platform_mutex_unlock(client->lock);
+
+  _send_frame(client, frame);
+  return 0;
+}
+
+int offs_client_friend_add_qr(offs_client_t* client, const uint8_t* ppm, size_t ppm_len,
+                              offs_peer_connect_cb_t callback, void* ctx) {
+  return offs_client_friend_add(client, 2, ppm, ppm_len, callback, ctx);
+}
+
+int offs_client_load(offs_client_t* client, const char* ori_string,
+                     uint8_t has_range, size_t range_start, size_t range_end,
+                     offs_load_progress_cb_t progress_cb, void* progress_ctx,
+                     offs_load_end_cb_t end_cb, void* end_ctx) {
+  if (client == NULL || !client->connected || ori_string == NULL) return -1;
+
+  client_api_load_request_t msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.ori_string = (char*)ori_string;
+  msg.has_range = has_range;
+  msg.range_start = range_start;
+  msg.range_end = range_end;
+
+  cbor_item_t* frame = client_api_load_request_encode(&msg);
+  if (frame == NULL) return -1;  /* cbor allocation failure */
+
+  platform_mutex_lock(client->lock);
+  client->load_progress_cb = progress_cb;
+  client->load_progress_cb_ctx = progress_ctx;
+  client->load_end_cb = end_cb;
+  client->load_end_cb_ctx = end_ctx;
+  platform_mutex_unlock(client->lock);
+
   _send_frame(client, frame);
   return 0;
 }

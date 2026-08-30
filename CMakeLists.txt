@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(offs C CXX)
+project(offs LANGUAGES C CXX VERSION 0.1.0)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
@@ -173,6 +173,10 @@ else()
 endif()
 
 add_library(offs STATIC ${C_SRC})
+# Propagate the project version as OFFS_VERSION so version.h's default
+# "0.0.0" is only a fallback for non-CMake builds. PUBLIC so consumers link
+# the version metadata. Update update_actor.c:183 reads this at runtime.
+target_compile_definitions(offs PUBLIC OFFS_VERSION="${PROJECT_VERSION}")
 # Opt-in AddressSanitizer instrumentation of the offs library only (not the
 # external deps: msquic/poll-dancer/libcbor are add_subdirectory/ExternalProject
 # targets that inherit CMAKE_C_FLAGS, so setting /fsanitize=address globally
@@ -184,8 +188,37 @@ add_library(offs STATIC ${C_SRC})
 # unaffected.
 option(OFFS_ENABLE_ASAN "Instrument the offs library with AddressSanitizer (MSVC) for debugging" OFF)
 if(OFFS_ENABLE_ASAN)
-  target_compile_options(offs PRIVATE /fsanitize=address /Z7)
+  if(MSVC)
+    target_compile_options(offs PRIVATE /fsanitize=address /Z7)
+  else()
+    # GCC/Clang: -fsanitize=address with -g for symbolicated stack traces.
+    # Scoping to the offs target (PRIVATE) keeps external deps uninstrumented,
+    # matching the MSVC policy above. The test executable must also enable ASan
+    # so the runtime is pulled in at link time — see OFFS_ENABLE_ASAN handling
+    # in test/CMakeLists.txt.
+    target_compile_options(offs PRIVATE -fsanitize=address -fno-omit-frame-pointer -g)
+    target_link_options(offs INTERFACE -fsanitize=address)
+  endif()
 endif()
+
+# Optional UndefinedBehaviorSanitizer and ThreadSanitizer (GCC/Clang only).
+# These are OFF by default and have no MSVC equivalent in this build. TSan and
+# ASan are mutually exclusive — do not enable both in the same build.
+option(OFFS_ENABLE_UBSAN "Instrument the offs library with UndefinedBehaviorSanitizer (GCC/Clang)" OFF)
+if(OFFS_ENABLE_UBSAN AND NOT MSVC)
+  target_compile_options(offs PRIVATE -fsanitize=undefined -fno-omit-frame-pointer -g)
+  target_link_options(offs INTERFACE -fsanitize=undefined)
+endif()
+
+option(OFFS_ENABLE_TSAN "Instrument the offs library with ThreadSanitizer (GCC/Clang). Mutually exclusive with OFFS_ENABLE_ASAN." OFF)
+if(OFFS_ENABLE_TSAN AND NOT MSVC)
+  if(OFFS_ENABLE_ASAN)
+    message(FATAL_ERROR "OFFS_ENABLE_TSAN and OFFS_ENABLE_ASAN are mutually exclusive; enable only one.")
+  endif()
+  target_compile_options(offs PRIVATE -fsanitize=thread -fno-omit-frame-pointer -g)
+  target_link_options(offs INTERFACE -fsanitize=thread)
+endif()
+
 # Release manifest signature verification: the ed25519 public key (PEM) used by
 # update_verify_manifest to verify signed release manifests. Pass a path to a
 # PEM file at configure time; the contents are embedded as a C string literal
@@ -357,18 +390,60 @@ else()
     message(FATAL_ERROR "OpenSSL not found.")
 endif()
 
-# libqrencode for QR code generation (optional)
-find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
-  pkg_check_modules(QRENCODE QUIET libqrencode)
-endif()
-if(QRENCODE_FOUND)
-  target_compile_definitions(offs PRIVATE HAS_QRENCODE)
-  target_include_directories(offs PRIVATE ${QRENCODE_INCLUDE_DIRS})
-  target_link_libraries(offs PRIVATE ${QRENCODE_LIBRARIES})
-  message(STATUS "libqrencode found — QR code generation enabled")
+# libqrencode — QR encoder, vendored submodule (deps/libqrencode). Required:
+# QR peer-info generation is a first-class client-API feature, not an optional
+# extra, so a missing submodule is a loud error like deps/bcrypt. Built
+# without PNG support and without CLI tools — only the core encoder is used,
+# via src/QR/qr.c (added by the next task).
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/deps/libqrencode/CMakeLists.txt)
+  set(WITH_TOOLS   OFF CACHE BOOL "" FORCE)
+  set(WITH_TESTS   OFF CACHE BOOL "" FORCE)
+  set(WITHOUT_PNG  ON  CACHE BOOL "" FORCE)
+  # libqrencode turns its own tests back on whenever BUILD_TESTING is set
+  # (its CMakeLists does `if(BUILD_TESTING) set(WITH_TESTS ON)`), which would
+  # defeat the WITH_TESTS=OFF above and register ctest entries for binaries
+  # that are never built. Shadow BUILD_TESTING with a plain directory-scoped
+  # variable just for this add_subdirectory — the cache value the project's
+  # own test suite (test/CMakeLists.txt) depends on stays untouched.
+  set(_OFFS_QRENCODE_BUILD_TESTING ${BUILD_TESTING})
+  set(BUILD_TESTING OFF)
+  add_subdirectory(deps/libqrencode EXCLUDE_FROM_ALL)
+  set(BUILD_TESTING ${_OFFS_QRENCODE_BUILD_TESTING})
+  unset(_OFFS_QRENCODE_BUILD_TESTING)
+  target_include_directories(offs PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/deps/libqrencode)
+  target_link_libraries(offs PRIVATE qrencode)
 else()
-  message(STATUS "libqrencode not found — QR code generation disabled")
+  message(FATAL_ERROR "deps/libqrencode submodule missing. Run: git submodule update --init --recursive")
+endif()
+
+# quirc — QR decoder, vendored submodule (deps/quirc). Upstream ships no
+# CMakeLists.txt (Makefile-only, see deps/quirc/Makefile LIB_OBJ), so compile
+# its four decoder sources (quirc.c, decode.c, identify.c, version_db.c)
+# directly into a static library. Only decode is used (via src/QR/qr.c).
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/deps/quirc/lib/quirc.c)
+  add_library(quirc STATIC
+    deps/quirc/lib/quirc.c
+    deps/quirc/lib/decode.c
+    deps/quirc/lib/identify.c
+    deps/quirc/lib/version_db.c)
+  target_include_directories(quirc PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/deps/quirc/lib)
+  # The default QUIRC_MAX_REGIONS=254 is too small for dense version-40 QR
+  # codes (one region per isolated module): the region budget is exhausted
+  # before the bottom-left finder pattern is labeled, making large payloads
+  # undecodable. 65000 is near quirc's documented ceiling (65534); pixel type
+  # widens beyond 8-bit automatically (16-bit for limits below UINT16_MAX).
+  target_compile_definitions(quirc PRIVATE QUIRC_MAX_REGIONS=65000)
+  if(NOT MSVC)
+    # identify.c uses rint/sqrt; MSVC's CRT provides both intrinsically.
+    target_link_libraries(quirc PUBLIC m)
+  endif()
+  if(MSVC)
+    # Silence size-conversion warnings in vendored code, matching the bcrypt target's policy.
+    target_compile_options(quirc PRIVATE /W0)
+  endif()
+  target_link_libraries(offs PRIVATE quirc)
+else()
+  message(FATAL_ERROR "deps/quirc submodule missing. Run: git submodule update --init --recursive")
 endif()
 
 add_subdirectory(src/Platform)
@@ -377,3 +452,29 @@ add_subdirectory(tools/offs-ca)
 add_subdirectory(tools/offs-release-sign)
 add_subdirectory(test)
 add_subdirectory(examples)
+
+# ---------------------------------------------------------------------------
+# Install / packaging
+# ---------------------------------------------------------------------------
+# Public client API headers — the installed surface of liboffs. Keep this
+# list explicit (not a glob) so an accidental header addition does not become
+# part of the installed API.
+set(OFFS_PUBLIC_HEADERS
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/ClientLibs/c/offs_client.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/ClientLibs/c/offs_ofd_resolver.h
+)
+
+include(GNUInstallDirs)
+install(TARGETS offs
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(FILES ${OFFS_PUBLIC_HEADERS}
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/offs)
+
+# Generate a pkg-config file so downstream consumers can do
+#   pkg-config --cflags --libs offs
+# The .pc.in template is configured with the install dirs and version.
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/offs.pc.in"
+               "${CMAKE_CURRENT_BINARY_DIR}/offs.pc" @ONLY)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/offs.pc"
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)

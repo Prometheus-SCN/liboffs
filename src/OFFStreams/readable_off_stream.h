@@ -32,6 +32,22 @@ typedef struct pending_tuple_t {
   struct pending_tuple_t* next;
 } pending_tuple_t;
 
+/* Progress payload for load_tuple_event (load mode only). Refcounted: the
+ * notify machinery holds references while dispatching, so handlers should
+ * copy the two counters out or take their own reference. */
+typedef struct {
+  refcounter_t refcounter;
+  size_t tuples_loaded;
+  size_t tuples_skipped;
+} load_tuple_payload_t;
+
+load_tuple_payload_t* load_tuple_payload_create(size_t tuples_loaded, size_t tuples_skipped);
+void load_tuple_payload_destroy(void* payload);
+
+/* Block size in bytes for a given block type. Shared by the descriptor, the
+ * off_stream and LOAD consumers that compute tuple totals from a file size. */
+size_t off_block_size_for_type(block_size_e type);
+
 typedef struct {
   stream_t stream;
   block_cache_t* bc;
@@ -42,6 +58,10 @@ typedef struct {
   size_t sent_bytes;
   size_t offset_remainder;
   uint8_t offset_applied;
+  uint8_t load_mode;                /* 1 = missing data tuples are skipped and tallied */
+  uint8_t closed;                   /* 1 = close_event already notified (render or request_close) */
+  size_t tuples_loaded;             /* tuples whose data was served / rendered */
+  size_t tuples_skipped;            /* tuples abandoned because blocks were missing */
   off_stream_state_e state;         /* stream state */
   /* Async decode state */
   tuple_t* pending_tuple;
@@ -49,9 +69,22 @@ typedef struct {
   size_t blocks_expected;
   size_t blocks_received;
   pending_block_fetch_t* pending_fetches;
+  /* Hashes of an already-skipped tuple that are STRICTLY UNANSWERED (answered
+   * fetches are pruned from pending_fetches as their results are consumed, see
+   * readable_off_stream.c): late results matching these are dropped so they
+   * cannot corrupt the live tuple's XOR accumulator. */
+  pending_block_fetch_t* stale_fetches;
   /* Queue of tuples waiting to be processed */
   pending_tuple_t* tuple_queue;
 } readable_off_stream_t;
+
+/* Load mode: missing data tuples are skipped and tallied (tuples_skipped)
+ * instead of deactivating the stream; each resolved tuple (loaded or skipped)
+ * emits load_tuple_event with a load_tuple_payload_t. Descriptor misses
+ * remain fatal. */
+readable_off_stream_t* readable_off_stream_create_ex(
+    scheduler_pool_t* pool, block_cache_t* bc, tuple_cache_t* tc,
+    ori_t* ori, size_t descriptor_pad, network_t* network, uint8_t load_mode);
 
 readable_off_stream_t* readable_off_stream_create(
     scheduler_pool_t* pool, block_cache_t* bc, tuple_cache_t* tc,
@@ -59,5 +92,12 @@ readable_off_stream_t* readable_off_stream_create(
 void readable_off_stream_destroy(readable_off_stream_t* stream);
 void readable_off_stream_dispatch(void* state, message_t* msg);
 void readable_off_stream_write(readable_off_stream_t* stream, tuple_t* tuple);
+
+/* Load mode: close the stream after the last tuple resolved (loaded+skipped
+   reached the enumerator's total), when rendering cannot complete because
+   skipped tuples never advance sent_bytes. Idempotent: no-op if already
+   deactivated or closed. Performs the same cleanup as CLOSE_STREAM and
+   notifies close_event (no error). */
+void readable_off_stream_request_close(readable_off_stream_t* stream);
 
 #endif //OFFS_READABLE_OFF_STREAM_H

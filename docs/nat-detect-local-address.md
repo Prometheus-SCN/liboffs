@@ -1,10 +1,11 @@
-# The NAT detector's `local_addr`: declared, consumed, never set
+# The NAT detector's `local_addr`, and who may read the NAT type
 
 Companion to `ARCHITECTURE.md` ("NAT Traversal") and `HowOFFSWorks.md`. This
-document records a gap found while porting the NAT detection to a downstream
+document records two findings from porting the NAT detection to a downstream
 codebase: the detector's `local_addr` field is declared, read by the
 classifier, and never assigned — so the `NAT_TYPE_OPEN` verdict is
-unreachable in production.
+unreachable in production; and the NAT type is state that only the owning
+actor may read, which a port that keeps it on a shared object has to respect.
 
 Date: 2026-10-24. Verified by reading `src/Network/nat_detect.c` and
 `src/Network/nat_detect.h` in full, and by searching `src/` for every
@@ -106,7 +107,30 @@ decision points: `conn_state_init()` puts all four in
 behaviourally distinct, because a symmetric NAT's mapping depends on the
 destination and a hole punch cannot be aimed at it.
 
-## 6. The default, for the same reason
+## 6. The NAT type's state, and who may read it
+
+The second finding: **upstream keeps the NAT type inside the network
+actor's state, and nothing reads it from another thread.**
+
+- `network->local_nat_type` is written in the network actor's own
+  dispatch — the default at `src/Network/network.c:359` and the
+  detection's result at `:5843` — and every read of it (`:845`, `:1106`,
+  `:1734`, `:5916`) is inside that same dispatch. The thread that writes
+  it is the thread that reads it.
+- `peer->peer_nat_type` is written (`src/Network/conn_state.c:145`,
+  `src/Network/peer_connection.c:33`) and never read: the decision points
+  consult the peer's `conn_state`, not the type.
+- `conn_state_get()` — the accessor that would read a peer's state from
+  another thread — has no callers in `src/`.
+
+A port that keeps the NAT type on an object the application holds a
+pointer to — rather than inside the actor that owns it — has to make that
+field atomic, or the application reads a value another thread is writing.
+It is not only a stale value: the compiler may hoist a plain load out of
+the loop that waits for the answer, so the wait may never see the update
+at all.
+
+## 7. The default, for the same reason
 
 `network->local_nat_type` starts as `NAT_TYPE_PORT_RESTRICTED_CONE`
 (`src/Network/network.c:359`), not as `NAT_TYPE_UNKNOWN` — before the

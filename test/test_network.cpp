@@ -5183,6 +5183,7 @@ TEST_F(AntiEntropyTest, DigestExchangeCapTruncatesLargeDifference) {
   for (size_t index = 0; index < offer_count; index++) offer.ids[index] = offer_ids[index];
   offer.id_count = (uint8_t)offer_count;
   cbor_item_t* encoded = wire_anti_entropy_offer_encode(&offer);
+  ASSERT_NE(encoded, nullptr);
   wire_anti_entropy_offer_t decoded = {};
   ASSERT_EQ(wire_anti_entropy_offer_decode(encoded, &decoded), 0);
   EXPECT_EQ(decoded.id_count, 10u);

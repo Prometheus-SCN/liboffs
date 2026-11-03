@@ -29,6 +29,7 @@ bool anti_entropy_bloom_check_raw(const uint8_t* bloom, const uint8_t* data, siz
 
 // Build a digest bloom over every ring member (primary + secondary of all
 // rings). Returns the number of member ids hashed in.
+// bloom must be zero-initialized by the caller (e.g. memset).
 size_t anti_entropy_bloom_build(const ring_set_t* rings, uint8_t* bloom);
 
 // Membership test of a single id against a digest bloom.

@@ -4772,3 +4772,166 @@ TEST_F(AntiEntropyTest, BloomFalsePositiveRateSane) {
 
   anti_entropy_destroy_nodes(members, 120);
 }
+
+// === Anti-entropy wire codecs ===
+
+class WireAntiEntropyDigestTest : public ::testing::Test {
+protected:
+  void SetUp() override {}
+  void TearDown() override {}
+};
+
+TEST_F(WireAntiEntropyDigestTest, Roundtrip) {
+  wire_anti_entropy_t original = {};
+  original.message_id = 0x1122334455667788ULL;
+  anti_entropy_fill_id(&original.sender_id, 0x70, 1);
+  for (int byte_index = 0; byte_index < (int)ANTI_ENTROPY_BLOOM_BYTES; byte_index++) {
+    original.bloom[byte_index] = (uint8_t)(byte_index * 7);
+  }
+  original.member_count = 120;
+
+  cbor_item_t* encoded = wire_anti_entropy_encode(&original);
+  ASSERT_NE(encoded, nullptr);
+
+  wire_anti_entropy_t decoded = {};
+  int rc = wire_anti_entropy_decode(encoded, &decoded);
+  ASSERT_EQ(rc, 0);
+
+  EXPECT_EQ(decoded.message_id, original.message_id);
+  EXPECT_TRUE(node_id_equals(&decoded.sender_id, &original.sender_id));
+  EXPECT_EQ(decoded.member_count, 120);
+  ASSERT_EQ(0, memcmp(decoded.bloom, original.bloom, ANTI_ENTROPY_BLOOM_BYTES));
+
+  cbor_decref(&encoded);
+}
+
+TEST_F(WireAntiEntropyDigestTest, RejectsWrongTypeByte) {
+  wire_anti_entropy_t original = {};
+  original.message_id = 0x0102030405060708ULL;
+  anti_entropy_fill_id(&original.sender_id, 0x70, 1);
+  cbor_item_t* encoded = wire_anti_entropy_encode(&original);
+  ASSERT_NE(encoded, nullptr);
+
+  // Corrupt the leading type byte to a different message type.
+  cbor_item_t* wrong_type = cbor_build_uint8(WIRE_GOSSIP);
+  ASSERT_TRUE(cbor_array_set(encoded, 0, wrong_type));
+  cbor_decref(&wrong_type);
+  wire_anti_entropy_t decoded = {};
+  EXPECT_EQ(wire_anti_entropy_decode(encoded, &decoded), -1);
+
+  cbor_decref(&encoded);
+}
+
+TEST_F(WireAntiEntropyDigestTest, RejectsOversizedBloom) {
+  wire_anti_entropy_t original = {};
+  cbor_item_t* encoded = wire_anti_entropy_encode(&original);
+  ASSERT_NE(encoded, nullptr);
+
+  // Replace the 512-byte bloom with a 256-byte bytestring — decode must
+  // reject rather than read out of bounds.
+  cbor_item_t* short_bloom = cbor_build_bytestring(original.bloom, 256);
+  ASSERT_TRUE(cbor_array_set(encoded, 4, short_bloom));
+  cbor_decref(&short_bloom);
+  wire_anti_entropy_t decoded = {};
+  EXPECT_EQ(wire_anti_entropy_decode(encoded, &decoded), -1);
+
+  cbor_decref(&encoded);
+}
+
+class WireAntiEntropyOfferTest : public ::testing::Test {
+protected:
+  void SetUp() override {}
+  void TearDown() override {}
+};
+
+TEST_F(WireAntiEntropyOfferTest, Roundtrip) {
+  wire_anti_entropy_offer_t original = {};
+  original.message_id = 0xAABBCCDDEEFF0011ULL;
+  anti_entropy_fill_id(&original.sender_id, 0x71, 2);
+  for (int byte_index = 0; byte_index < (int)ANTI_ENTROPY_BLOOM_BYTES; byte_index++) {
+    original.bloom[byte_index] = (uint8_t)(byte_index * 3);
+  }
+  original.id_count = 2;
+  anti_entropy_fill_id(&original.ids[0], 0x72, 11);
+  anti_entropy_fill_id(&original.ids[1], 0x72, 12);
+
+  cbor_item_t* encoded = wire_anti_entropy_offer_encode(&original);
+  ASSERT_NE(encoded, nullptr);
+
+  wire_anti_entropy_offer_t decoded = {};
+  int rc = wire_anti_entropy_offer_decode(encoded, &decoded);
+  ASSERT_EQ(rc, 0);
+
+  EXPECT_EQ(decoded.message_id, original.message_id);
+  EXPECT_TRUE(node_id_equals(&decoded.sender_id, &original.sender_id));
+  EXPECT_EQ(decoded.id_count, 2);
+  EXPECT_TRUE(node_id_equals(&decoded.ids[0], &original.ids[0]));
+  EXPECT_TRUE(node_id_equals(&decoded.ids[1], &original.ids[1]));
+  ASSERT_EQ(0, memcmp(decoded.bloom, original.bloom, ANTI_ENTROPY_BLOOM_BYTES));
+
+  cbor_decref(&encoded);
+}
+
+TEST_F(WireAntiEntropyOfferTest, ClampsOversizedIdCount) {
+  wire_anti_entropy_offer_t original = {};
+  original.id_count = 200;  // above WIRE_ANTI_ENTROPY_MAX_IDS
+  for (int index = 0; index < WIRE_ANTI_ENTROPY_MAX_IDS; index++) {
+    anti_entropy_fill_id(&original.ids[index], 0x73, index);
+  }
+  memset(original.bloom, 1, ANTI_ENTROPY_BLOOM_BYTES);
+
+  cbor_item_t* encoded = wire_anti_entropy_offer_encode(&original);
+  ASSERT_NE(encoded, nullptr);
+
+  wire_anti_entropy_offer_t decoded = {};
+  ASSERT_EQ(wire_anti_entropy_offer_decode(encoded, &decoded), 0);
+  EXPECT_EQ(decoded.id_count, (uint8_t)WIRE_ANTI_ENTROPY_MAX_IDS);
+  for (int index = 0; index < WIRE_ANTI_ENTROPY_MAX_IDS; index++) {
+    EXPECT_TRUE(node_id_equals(&decoded.ids[index], &original.ids[index]));
+  }
+
+  cbor_decref(&encoded);
+}
+
+class WireAntiEntropyResponseTest : public ::testing::Test {
+protected:
+  void SetUp() override {}
+  void TearDown() override {}
+};
+
+TEST_F(WireAntiEntropyResponseTest, Roundtrip) {
+  wire_anti_entropy_offer_t original = {};
+  original.message_id = 0x00FEDA76543210EFULL;
+  anti_entropy_fill_id(&original.sender_id, 0x74, 4);
+  original.id_count = 3;
+  anti_entropy_fill_id(&original.ids[0], 0x75, 21);
+  anti_entropy_fill_id(&original.ids[1], 0x75, 22);
+  anti_entropy_fill_id(&original.ids[2], 0x75, 23);
+
+  cbor_item_t* encoded = wire_anti_entropy_response_encode(&original);
+  ASSERT_NE(encoded, nullptr);
+
+  wire_anti_entropy_offer_t decoded = {};
+  int rc = wire_anti_entropy_response_decode(encoded, &decoded);
+  ASSERT_EQ(rc, 0);
+
+  EXPECT_EQ(decoded.message_id, original.message_id);
+  EXPECT_TRUE(node_id_equals(&decoded.sender_id, &original.sender_id));
+  EXPECT_EQ(decoded.id_count, 3);
+  for (int index = 0; index < 3; index++) {
+    EXPECT_TRUE(node_id_equals(&decoded.ids[index], &original.ids[index]));
+  }
+
+  cbor_decref(&encoded);
+}
+
+TEST_F(WireAntiEntropyResponseTest, RejectsResponseEncodedAsOfferType) {
+  wire_anti_entropy_offer_t original = {};
+  cbor_item_t* encoded = wire_anti_entropy_response_encode(&original);
+  ASSERT_NE(encoded, nullptr);
+
+  wire_anti_entropy_offer_t decoded = {};
+  EXPECT_EQ(wire_anti_entropy_offer_decode(encoded, &decoded), -1);
+
+  cbor_decref(&encoded);
+}

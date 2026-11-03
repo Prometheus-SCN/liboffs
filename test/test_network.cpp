@@ -4696,6 +4696,20 @@ static void anti_entropy_fill_id(node_id_t* id, uint8_t marker, int index) {
   id->hash[2] = (uint8_t)((index >> 8) & 0xFF);
 }
 
+// Mirror of wire.c's static _node_id_encode layout: a 2-element array of
+// [hash bytestring, str bytestring]. Lets hostile-packet tests hand-build
+// node ids without routing through a legitimate message encoder.
+static cbor_item_t* anti_entropy_test_node_id_encode(const node_id_t* id) {
+  cbor_item_t* array = cbor_new_definite_array(2);
+  cbor_item_t* hash = cbor_build_bytestring(id->hash, NODE_ID_HASH_SIZE);
+  cbor_item_t* str = cbor_build_bytestring((const unsigned char*)id->str, strlen(id->str));
+  (void)cbor_array_push(array, hash);
+  (void)cbor_array_push(array, str);
+  cbor_decref(&hash);
+  cbor_decref(&str);
+  return array;
+}
+
 class AntiEntropyTest : public ::testing::Test {
 protected:
   ring_set_t* rings;
@@ -4822,6 +4836,21 @@ TEST_F(WireAntiEntropyDigestTest, RejectsWrongTypeByte) {
   cbor_decref(&encoded);
 }
 
+TEST_F(WireAntiEntropyDigestTest, RejectsOfferEncodedAsDigestType) {
+  // An offer is a different message type than a digest: the digest decoder
+  // must reject it on the type byte rather than misparse the trailing ids.
+  wire_anti_entropy_offer_t original = {};
+  original.id_count = 1;
+  anti_entropy_fill_id(&original.ids[0], 0x7A, 1);
+  cbor_item_t* encoded = wire_anti_entropy_offer_encode(&original);
+  ASSERT_NE(encoded, nullptr);
+
+  wire_anti_entropy_t decoded = {};
+  EXPECT_EQ(wire_anti_entropy_decode(encoded, &decoded), -1);
+
+  cbor_decref(&encoded);
+}
+
 TEST_F(WireAntiEntropyDigestTest, RejectsOversizedBloom) {
   wire_anti_entropy_t original = {};
   cbor_item_t* encoded = wire_anti_entropy_encode(&original);
@@ -4893,6 +4922,67 @@ TEST_F(WireAntiEntropyOfferTest, ClampsOversizedIdCount) {
   cbor_decref(&encoded);
 }
 
+TEST_F(WireAntiEntropyOfferTest, DecoderClampsHostileOversizedIdCount) {
+  // Hand-build a hostile offer: the count element says 200 and the ids child
+  // array really carries 200 elements — something no legitimate encoder can
+  // produce (wire_anti_entropy_offer_encode clamps id_count to MAX_IDS). The
+  // decoder must clamp id_count to MAX_IDS without writing past msg->ids[9].
+  node_id_t expected_ids[WIRE_ANTI_ENTROPY_MAX_IDS];
+  uint8_t hostile_bloom[WIRE_ANTI_ENTROPY_BLOOM_BYTES] = { 1 };
+
+  cbor_item_t* hostile = cbor_new_definite_array(7);
+  cbor_item_t* item = cbor_build_uint8(WIRE_ANTI_ENTROPY_OFFER);
+  (void)cbor_array_push(hostile, item);
+  cbor_decref(&item);
+
+  item = cbor_build_uint64(0);
+  (void)cbor_array_push(hostile, item);
+  cbor_decref(&item);
+
+  item = cbor_build_uint64(1);
+  (void)cbor_array_push(hostile, item);
+  cbor_decref(&item);
+
+  node_id_t sender_id;
+  anti_entropy_fill_id(&sender_id, 0x78, 1);
+  cbor_item_t* sender = anti_entropy_test_node_id_encode(&sender_id);
+  (void)cbor_array_push(hostile, sender);
+  cbor_decref(&sender);
+
+  cbor_item_t* bloom = cbor_build_bytestring(hostile_bloom, WIRE_ANTI_ENTROPY_BLOOM_BYTES);
+  (void)cbor_array_push(hostile, bloom);
+  cbor_decref(&bloom);
+
+  item = cbor_build_uint8(200);  // hostile oversized count
+  (void)cbor_array_push(hostile, item);
+  cbor_decref(&item);
+
+  cbor_item_t* ids = cbor_new_definite_array(200);
+  for (int index = 0; index < 200; index++) {
+    node_id_t element_id;
+    anti_entropy_fill_id(&element_id, 0x79, index);
+    if (index < WIRE_ANTI_ENTROPY_MAX_IDS) {
+      expected_ids[index] = element_id;
+    }
+    cbor_item_t* node_id = anti_entropy_test_node_id_encode(&element_id);
+    (void)cbor_array_push(ids, node_id);
+    cbor_decref(&node_id);
+  }
+  (void)cbor_array_push(hostile, ids);
+  cbor_decref(&ids);
+
+  wire_anti_entropy_offer_t decoded = {};
+  ASSERT_EQ(wire_anti_entropy_offer_decode(hostile, &decoded), 0);
+  EXPECT_EQ(decoded.id_count, (uint8_t)WIRE_ANTI_ENTROPY_MAX_IDS);
+  // Every decoded id must be the offered element at that index (the first
+  // MAX_IDS of the 200, in order).
+  for (int index = 0; index < WIRE_ANTI_ENTROPY_MAX_IDS; index++) {
+    EXPECT_TRUE(node_id_equals(&decoded.ids[index], &expected_ids[index])) << "id " << index;
+  }
+
+  cbor_decref(&hostile);
+}
+
 class WireAntiEntropyResponseTest : public ::testing::Test {
 protected:
   void SetUp() override {}
@@ -4932,6 +5022,21 @@ TEST_F(WireAntiEntropyResponseTest, RejectsResponseEncodedAsOfferType) {
 
   wire_anti_entropy_offer_t decoded = {};
   EXPECT_EQ(wire_anti_entropy_offer_decode(encoded, &decoded), -1);
+
+  cbor_decref(&encoded);
+}
+
+TEST_F(WireAntiEntropyResponseTest, RejectsOfferEncodedAsResponseType) {
+  // An offer carries a bloom element that a response has no field for: the
+  // response decoder must reject it on the type byte, not shift the layout.
+  wire_anti_entropy_offer_t original = {};
+  original.id_count = 1;
+  anti_entropy_fill_id(&original.ids[0], 0x7A, 2);
+  cbor_item_t* encoded = wire_anti_entropy_offer_encode(&original);
+  ASSERT_NE(encoded, nullptr);
+
+  wire_anti_entropy_offer_t decoded = {};
+  EXPECT_EQ(wire_anti_entropy_response_decode(encoded, &decoded), -1);
 
   cbor_decref(&encoded);
 }

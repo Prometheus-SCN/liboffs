@@ -118,6 +118,7 @@ typedef struct network_t {
   connection_manager_t conn_mgr;
   struct respiration_actor_t* respiration;
   ATOMIC(uint64_t) gossip_timer_id;
+  ATOMIC(uint64_t) anti_entropy_timer_id;
   ATOMIC(uint64_t) eabf_maintenance_timer_id;
   uint64_t hebbian_decay_timer_id;
   ATOMIC(uint64_t) metrics_push_timer_id;
@@ -136,6 +137,7 @@ typedef struct network_t {
   size_t gossip_init_count;
   uint32_t gossip_steady_interval_s;
   uint32_t gossip_timeout_ms;
+  uint32_t anti_entropy_interval_s;
   float hebbian_decay_factor;
   uint32_t eabf_base_ttl_ms;
   uint32_t eabf_maintenance_ms;

@@ -364,6 +364,7 @@ network_t* network_create(authority_t* authority, block_cache_t* block_cache,
   network->gossip_init_count = config->gossip_init_count;
   network->gossip_steady_interval_s = config->gossip_steady_interval_s;
   network->gossip_timeout_ms = config->gossip_timeout_ms;
+  network->anti_entropy_interval_s = config->anti_entropy_interval_s;
   network->hebbian_decay_factor = config->hebbian_decay_factor;
   network->peer_state_save_interval_ms = config->peer_state_save_interval_ms;
   network->peer_state_ttl_ms = config->peer_state_ttl_ms;
@@ -406,6 +407,17 @@ network_t* network_create(authority_t* authority, block_cache_t* block_cache,
       &network->actor,
       NETWORK_GOSSIP_TICK,
       &network->gossip_timer_id);
+
+  // Anti-entropy timer: one digest exchange per tick with a random
+  // connected peer. Repair is part of correctness, not an optimization, so
+  // there is no zero-disable; config validation floors the interval at 10s.
+  network->anti_entropy_timer_id = 0;
+  timer_actor_set(timer,
+      (uint64_t)network->anti_entropy_interval_s * 1000,
+      (uint64_t)network->anti_entropy_interval_s * 1000,
+      &network->actor,
+      NETWORK_ANTI_ENTROPY_TICK,
+      &network->anti_entropy_timer_id);
 
   // Start the recurring peer-state save tick. NOT a debounce: the gossip
   // tick marks peer state dirty every cycle (Hebbian decay), which
@@ -541,6 +553,10 @@ void network_destroy(network_t* network) {
   }
   if (atomic_load(&network->gossip_timer_id) != 0) {
     timer_actor_cancel(network->timer, atomic_load(&network->gossip_timer_id));
+  }
+  if (atomic_load(&network->anti_entropy_timer_id) != 0) {
+    timer_actor_cancel(network->timer, atomic_load(&network->anti_entropy_timer_id));
+    atomic_store(&network->anti_entropy_timer_id, 0);
   }
   if (atomic_load(&network->eabf_maintenance_timer_id) != 0) {
     timer_actor_cancel(network->timer, atomic_load(&network->eabf_maintenance_timer_id));

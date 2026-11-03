@@ -5040,3 +5040,155 @@ TEST_F(WireAntiEntropyResponseTest, RejectsOfferEncodedAsResponseType) {
 
   cbor_decref(&encoded);
 }
+
+// === Anti-entropy three-leg convergence (codec-mediated) ===
+// Executes the exchange exactly as the handlers wire it:
+//   leg 1: A -> B   = bloom over A's rings
+//   leg 2: B -> A   = OFFER(bloom_b, ids B holds absent in bloom_a)
+//   leg 3: A -> B   = insert offered ids; RESPONSE(ids A holds absent in bloom_b)
+//   leg 4: B inserts response ids. Both sets then equal.
+TEST_F(AntiEntropyTest, DigestExchangeConvergesThroughWire) {
+  ring_set_t* rings_a = rings;
+  ring_set_t* rings_b = ring_set_create(RING_K, RING_M, RING_ALPHA);
+
+  // Distinct ids via the memset helper (node_id_from_string is a base58
+  // decoder that zeroes unknown strings — do not use it for distinct ids).
+  node_id_t a_ids[3];
+  net_node_t* a_members[16] = { NULL };
+  size_t a_member_count = 0;
+  for (int index = 0; index < 3; index++) {
+    anti_entropy_fill_id(&a_ids[index], 0x71, index);
+    a_members[a_member_count] = net_node_create(&a_ids[index], 0x0A000001, 8080);
+    ASSERT_NE(a_members[a_member_count], nullptr);
+    ASSERT_EQ(ring_set_insert(rings_a, a_members[a_member_count],
+                              (uint32_t)(5000 * (index + 1))), 0);
+    a_member_count++;
+  }
+
+  node_id_t b_ids[5];
+  net_node_t* b_members[16] = { NULL };
+  size_t b_member_count = 0;
+  for (int index = 0; index < 5; index++) {
+    anti_entropy_fill_id(&b_ids[index], 0x72, index);
+    b_members[b_member_count] = net_node_create(&b_ids[index], 0x0B000001, 9080);
+    ASSERT_NE(b_members[b_member_count], nullptr);
+    ASSERT_EQ(ring_set_insert(rings_b, b_members[b_member_count],
+                              (uint32_t)(6000 * (index + 1))), 0);
+    b_member_count++;
+  }
+
+  uint8_t bloom_a[ANTI_ENTROPY_BLOOM_BYTES] = {};
+  uint8_t bloom_b[ANTI_ENTROPY_BLOOM_BYTES] = {};
+  EXPECT_EQ(anti_entropy_bloom_build(rings_a, bloom_a), 3u);
+  EXPECT_EQ(anti_entropy_bloom_build(rings_b, bloom_b), 5u);
+
+  // Leg 2: B collects ids absent in A's filter and sends them encoded.
+  node_id_t offered[ANTI_ENTROPY_MAX_IDS];
+  size_t offered_count = anti_entropy_collect_novel(rings_b, bloom_a, offered, ANTI_ENTROPY_MAX_IDS);
+  EXPECT_EQ(offered_count, 5u);  // sets are disjoint
+
+  wire_anti_entropy_offer_t offer = {};
+  offer.message_id = 0x1000000000000001ULL;
+  for (size_t index = 0; index < offered_count; index++) offer.ids[index] = offered[index];
+  offer.id_count = (uint8_t)offered_count;
+  cbor_item_t* offered_cbor = wire_anti_entropy_offer_encode(&offer);
+  ASSERT_NE(offered_cbor, nullptr);
+  wire_anti_entropy_offer_t received_offer = {};
+  ASSERT_EQ(wire_anti_entropy_offer_decode(offered_cbor, &received_offer), 0);
+  cbor_decref(&offered_cbor);
+
+  // A's receive side of the offer: insert novel ids (tracked for cleanup).
+  for (uint8_t index = 0; index < received_offer.id_count && index < ANTI_ENTROPY_MAX_IDS; index++) {
+    node_id_t* id = &received_offer.ids[index];
+    if (ring_set_find_by_id(rings_a, id) != NULL) continue;
+    net_node_t* node = net_node_create(id, 0, 0);
+    ASSERT_NE(node, nullptr);
+    ASSERT_EQ(ring_set_insert(rings_a, node, 0), 0);
+    a_members[a_member_count++] = node;
+  }
+  // B's set has 5 members, all novel to A, so A now holds 3 + 5 = 8.
+  EXPECT_EQ(a_member_count, 8u);
+
+  // Leg 3: A collects its ids absent in B's filter. The 5 just inserted ARE
+  // B's own ids, so they test present in bloom_b by construction; only A's
+  // 3 originals are novel to B.
+  node_id_t response_ids[ANTI_ENTROPY_MAX_IDS];
+  size_t response_count = anti_entropy_collect_novel(rings_a, bloom_b, response_ids, ANTI_ENTROPY_MAX_IDS);
+  EXPECT_EQ(response_count, 3u);
+  EXPECT_LE(response_count, (size_t)ANTI_ENTROPY_MAX_IDS);
+
+  wire_anti_entropy_offer_t response = {};
+  response.message_id = 0x1000000000000002ULL;
+  for (size_t index = 0; index < response_count; index++) response.ids[index] = response_ids[index];
+  response.id_count = (uint8_t)response_count;
+  cbor_item_t* response_cbor = wire_anti_entropy_response_encode(&response);
+  ASSERT_NE(response_cbor, nullptr);
+  wire_anti_entropy_offer_t received_response = {};
+  ASSERT_EQ(wire_anti_entropy_response_decode(response_cbor, &received_response), 0);
+  cbor_decref(&response_cbor);
+
+  // B's receive side of the response: insert.
+  for (uint8_t index = 0; index < received_response.id_count && index < ANTI_ENTROPY_MAX_IDS; index++) {
+    node_id_t* id = &received_response.ids[index];
+    if (ring_set_find_by_id(rings_b, id) != NULL) continue;
+    net_node_t* node = net_node_create(id, 0, 0);
+    ASSERT_NE(node, nullptr);
+    ASSERT_EQ(ring_set_insert(rings_b, node, 0), 0);
+    b_members[b_member_count++] = node;
+  }
+  EXPECT_EQ(b_member_count, 8u);
+
+  // Both directions converged: every A id is in B, every B id is in A.
+  for (int index = 0; index < 3; index++) {
+    EXPECT_TRUE(ring_set_find_by_id(rings_b, &a_ids[index]) != NULL) << "missing in B: index " << index;
+  }
+  for (int index = 0; index < 5; index++) {
+    EXPECT_TRUE(ring_set_find_by_id(rings_a, &b_ids[index]) != NULL) << "missing in A: index " << index;
+  }
+
+  anti_entropy_destroy_nodes(a_members, a_member_count);
+  anti_entropy_destroy_nodes(b_members, b_member_count);
+  ring_set_destroy(rings_b);
+}
+
+TEST_F(AntiEntropyTest, DigestExchangeCapTruncatesLargeDifference) {
+  // A: 1 member. B: 15 members, all disjoint. The offer to A must cap at
+  // ANTI_ENTROPY_MAX_IDS even though the true difference is 15.
+  node_id_t anchor_id;
+  anti_entropy_fill_id(&anchor_id, 0x76, 1);
+  net_node_t* anchor = net_node_create(&anchor_id, 0x0A000001, 8080);
+  ASSERT_NE(anchor, nullptr);
+  ASSERT_EQ(ring_set_insert(rings, anchor, 5000), 0);
+
+  ring_set_t* rings_b = ring_set_create(RING_K, RING_M, RING_ALPHA);
+  net_node_t* b_members[15] = { NULL };
+  for (int index = 0; index < 15; index++) {
+    node_id_t id;
+    anti_entropy_fill_id(&id, 0x77, index);
+    b_members[index] = net_node_create(&id, 0x0B000001, 9080);
+    ASSERT_NE(b_members[index], nullptr);
+    ASSERT_EQ(ring_set_insert(rings_b, b_members[index], (uint32_t)(7000 * (index + 1))), 0);
+  }
+
+  uint8_t bloom_a[ANTI_ENTROPY_BLOOM_BYTES] = {};
+  ASSERT_EQ(anti_entropy_bloom_build(rings, bloom_a), 1u);
+
+  node_id_t offer_ids[ANTI_ENTROPY_MAX_IDS];
+  size_t offer_count = anti_entropy_collect_novel(rings_b, bloom_a, offer_ids, ANTI_ENTROPY_MAX_IDS);
+  EXPECT_EQ(offer_count, (size_t)ANTI_ENTROPY_MAX_IDS);
+  EXPECT_EQ(offer_count, 10u);
+
+  wire_anti_entropy_offer_t offer = {};
+  offer.message_id = 0x2000000000000001ULL;
+  for (size_t index = 0; index < offer_count; index++) offer.ids[index] = offer_ids[index];
+  offer.id_count = (uint8_t)offer_count;
+  cbor_item_t* encoded = wire_anti_entropy_offer_encode(&offer);
+  wire_anti_entropy_offer_t decoded = {};
+  ASSERT_EQ(wire_anti_entropy_offer_decode(encoded, &decoded), 0);
+  EXPECT_EQ(decoded.id_count, 10u);
+  cbor_decref(&encoded);
+
+  net_node_destroy(anchor);
+  anti_entropy_destroy_nodes(b_members, 15);
+  ring_set_destroy(rings_b);
+}

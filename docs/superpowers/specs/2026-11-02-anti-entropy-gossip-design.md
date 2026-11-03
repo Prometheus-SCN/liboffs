@@ -93,7 +93,8 @@ ring — identical to how gossip-received targets are inserted. Updated
 `last_gossip_time` and `net_node_record_success` come for free.
 
 Because legs 2/3 fire synchronously in the receive handler, nothing waits on a
-reply; the only timeout surface is the existing query table for the digest leg.
+reply: no new timeout state and no query-table registration — the message ids
+exist only for the message log.
 
 ### Caps and chaff bound
 

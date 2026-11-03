@@ -1398,7 +1398,11 @@ static void network_add_node_to_ring(network_t* network,
         node->rendv_family = PLATFORM_AF_INET6;
         memcpy(node->rendv6, v6_addr->bytes, 16);
       }
-      ring_set_insert(network->rings, node, latency_us);
+      if (ring_set_insert(network->rings, node, latency_us) != 0) {
+        // Insert can fail only on a full ring; destroying is the correct
+        // release (slots are fixed-size; no reclamation).
+        net_node_destroy(node);
+      }
     }
     return;
   }
@@ -1427,7 +1431,11 @@ static void network_add_node_to_ring(network_t* network,
         node->rendv_family = PLATFORM_AF_INET6;
         memcpy(node->rendv6, v6_addr->bytes, 16);
       }
-      ring_set_insert(network->rings, node, 0);
+      if (ring_set_insert(network->rings, node, 0) != 0) {
+        // Insert can fail only on a full ring; destroying is the correct
+        // release (slots are fixed-size; no reclamation).
+        net_node_destroy(node);
+      }
     }
   }
 }
@@ -2481,12 +2489,18 @@ static void network_handle_anti_entropy_offer_received(network_t* network, messa
                        0, &network->hebbian);
   }
 
-  // The id count is already clamped by the decoder; network_add_node_to_ring
-  // skips already-known ids, so at most ANTI_ENTROPY_MAX_IDS new insertions.
-  for (uint8_t index = 0;
-       index < offer->id_count && index < ANTI_ENTROPY_MAX_IDS;
-       index++) {
-    network_add_node_to_ring(network, &offer->ids[index], 0, 0, NULL);
+  // Decoder clamps id_count; the struct-array bound is belt-and-braces
+  // against a miscompiled assert. network_add_node_to_ring skips
+  // already-known ids, so at most ANTI_ENTROPY_MAX_IDS new insertions.
+  // Per-id decode failures leave a zeroed id in the array; skip it (an
+  // all-zero id would otherwise insert as one routable node).
+  if (network->rings != NULL) {
+    for (uint8_t index = 0;
+         index < offer->id_count && index < ANTI_ENTROPY_MAX_IDS;
+         index++) {
+      if (node_id_is_null(&offer->ids[index])) continue;
+      network_add_node_to_ring(network, &offer->ids[index], 0, 0, NULL);
+    }
   }
 
   peer_connection_t* peer = connection_manager_lookup(&network->conn_mgr, &offer->sender_id);
@@ -2520,10 +2534,14 @@ static void network_handle_anti_entropy_response_received(network_t* network, me
                        0, &network->hebbian);
   }
 
-  for (uint8_t index = 0;
-       index < response->id_count && index < ANTI_ENTROPY_MAX_IDS;
-       index++) {
-    network_add_node_to_ring(network, &response->ids[index], 0, 0, NULL);
+  // Same clamping/zero-id rationale as the offer handler above.
+  if (network->rings != NULL) {
+    for (uint8_t index = 0;
+         index < response->id_count && index < ANTI_ENTROPY_MAX_IDS;
+         index++) {
+      if (node_id_is_null(&response->ids[index])) continue;
+      network_add_node_to_ring(network, &response->ids[index], 0, 0, NULL);
+    }
   }
 }
 

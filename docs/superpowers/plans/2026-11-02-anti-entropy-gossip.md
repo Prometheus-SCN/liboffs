@@ -14,8 +14,23 @@
 
 ```bash
 cmake --build build-test --target testliboffs -j8
-./build-test/testliboffs --gtest_filter='AntiEntropyTest.*'
+./build-test/test/testliboffs --gtest_filter='AntiEntropyTest.*'
 ```
+
+(NOTE added during Task 1 execution: the gtest binary lives at `build-test/test/testliboffs`. Also, `file(GLOB_RECURSE C_SRC)` has no `CONFIGURE_DEPENDS` — run `cmake -S . -B build-test` after adding any new .c file, and use the same `build-vg/test/` path under valgrind.)
+
+**Distinct-id rule for tests (added during Task 1 execution):** `node_id_from_string()` is a *base58 decoder* — on a non-base58 string it calls `node_id_clear()` and returns -1, so every plain name ("node-ae-a1"…) yields the all-zero id. Any test that needs distinct ids must use the file-local helper installed by Task 1:
+
+```cpp
+static void anti_entropy_fill_id(node_id_t* id, uint8_t marker, int index) {
+  memset(id, 0, sizeof(*id));
+  id->hash[0] = marker;
+  id->hash[1] = (uint8_t)(index & 0xFF);
+  id->hash[2] = (uint8_t)((index >> 8) & 0xFF);
+}
+```
+
+(Equality-only assertions on a zero id are still valid round-trip checks, but prefer distinct ids everywhere.)
 
 The `offs` library globs `src/*/*.c` (`CMakeLists.txt:89`), so the new module needs **no** CMake change. `test_network.cpp` is compiled into `testliboffs` (`test/CMakeLists.txt:114`), so its new tests live there; config tests live in `test/test_config_validate.cpp`.
 
@@ -41,25 +56,11 @@ static void anti_entropy_destroy_nodes(net_node_t* const* members, size_t count)
   }
 }
 
-class AntiEntropyTest : public ::testing::Test {
-protected:
-  ring_set_t* rings;
-
-  void SetUp() override {
-    rings = ring_set_create(RING_K, RING_M, RING_ALPHA);
-  }
-
-  void TearDown() override {
-    ring_set_destroy(rings);
-  }
-};
-
 TEST_F(AntiEntropyTest, BloomBuildMatchesInsertedMembers) {
-  const char* names[3] = { "node-ae-a1", "node-ae-a2", "node-ae-a3" };
   net_node_t* members[3] = { NULL, NULL, NULL };
   for (int index = 0; index < 3; index++) {
     node_id_t id;
-    node_id_from_string(names[index], &id);
+    anti_entropy_fill_id(&id, 0x51, index);
     members[index] = net_node_create(&id, 0x0A000001, 8080);
     ASSERT_NE(members[index], nullptr);
     ASSERT_EQ(ring_set_insert(rings, members[index], (uint32_t)(5000 * (index + 1))), 0);
@@ -87,13 +88,17 @@ TEST_F(AntiEntropyTest, BloomEmptySetBuildsZeroFilter) {
 TEST_F(AntiEntropyTest, BloomFalsePositiveRateSane) {
   node_id_t member_ids[120];
   net_node_t* members[120];
+  // Each ring holds 8 primary + 4 secondary = 12 members; a fixed latency
+  // would park all 120 in one ring and overflow after 12 inserts, so cycle
+  // the latency across all 10 rings (12 members each) to fill the set.
   for (int index = 0; index < 120; index++) {
-    char name[32];
-    snprintf(name, sizeof(name), "node-ae-mem-%03d", index);
-    node_id_from_string(name, &member_ids[index]);
+    int ring_slot = index % 10;
+    uint32_t latency_us = (ring_slot == 0) ? 1000u
+        : (uint32_t)(5000u << (ring_slot - 1));
+    anti_entropy_fill_id(&member_ids[index], 0x52, index);
     members[index] = net_node_create(&member_ids[index], 0x0A000001, 8080);
     ASSERT_NE(members[index], nullptr);
-    ASSERT_EQ(ring_set_insert(rings, members[index], 5000), 0);
+    ASSERT_EQ(ring_set_insert(rings, members[index], latency_us), 0);
   }
 
   uint8_t bloom[ANTI_ENTROPY_BLOOM_BYTES] = {};
@@ -102,9 +107,7 @@ TEST_F(AntiEntropyTest, BloomFalsePositiveRateSane) {
   node_id_t absent_id;
   int false_positives = 0;
   for (int index = 0; index < 200; index++) {
-    char name[32];
-    snprintf(name, sizeof(name), "node-ae-abs-%03d", index);
-    node_id_from_string(name, &absent_id);
+    anti_entropy_fill_id(&absent_id, 0x53, index);
     if (anti_entropy_bloom_check(bloom, &absent_id)) false_positives++;
   }
   // Every inserted member must test present.
@@ -325,7 +328,7 @@ protected:
 TEST_F(WireAntiEntropyDigestTest, Roundtrip) {
   wire_anti_entropy_t original = {};
   original.message_id = 0x1122334455667788ULL;
-  node_id_from_string("node-ae-digest-sender", &original.sender_id);
+  anti_entropy_fill_id(&original.sender_id, 0x70, 1);
   for (int byte_index = 0; byte_index < (int)ANTI_ENTROPY_BLOOM_BYTES; byte_index++) {
     original.bloom[byte_index] = (uint8_t)(byte_index * 7);
   }
@@ -349,7 +352,7 @@ TEST_F(WireAntiEntropyDigestTest, Roundtrip) {
 TEST_F(WireAntiEntropyDigestTest, RejectsWrongTypeByte) {
   wire_anti_entropy_t original = {};
   original.message_id = 0x0102030405060708ULL;
-  node_id_from_string("node-ae-digest-sender", &original.sender_id);
+  anti_entropy_fill_id(&original.sender_id, 0x70, 1);
   cbor_item_t* encoded = wire_anti_entropy_encode(&original);
   ASSERT_NE(encoded, nullptr);
 
@@ -390,13 +393,13 @@ protected:
 TEST_F(WireAntiEntropyOfferTest, Roundtrip) {
   wire_anti_entropy_offer_t original = {};
   original.message_id = 0xAABBCCDDEEFF0011ULL;
-  node_id_from_string("node-ae-offer-sender", &original.sender_id);
+  anti_entropy_fill_id(&original.sender_id, 0x71, 2);
   for (int byte_index = 0; byte_index < (int)ANTI_ENTROPY_BLOOM_BYTES; byte_index++) {
     original.bloom[byte_index] = (uint8_t)(byte_index * 3);
   }
   original.id_count = 2;
-  node_id_from_string("node-ae-offer-id-a", &original.ids[0]);
-  node_id_from_string("node-ae-offer-id-b", &original.ids[1]);
+  anti_entropy_fill_id(&original.ids[0], 0x72, 11);
+  anti_entropy_fill_id(&original.ids[1], 0x72, 12);
 
   cbor_item_t* encoded = wire_anti_entropy_offer_encode(&original);
   ASSERT_NE(encoded, nullptr);
@@ -419,9 +422,7 @@ TEST_F(WireAntiEntropyOfferTest, ClampsOversizedIdCount) {
   wire_anti_entropy_offer_t original = {};
   original.id_count = 200;  // above WIRE_ANTI_ENTROPY_MAX_IDS
   for (int index = 0; index < WIRE_ANTI_ENTROPY_MAX_IDS; index++) {
-    char name[32];
-    snprintf(name, sizeof(name), "node-ae-clamp-%03d", index);
-    node_id_from_string(name, &original.ids[index]);
+    anti_entropy_fill_id(&original.ids[index], 0x73, index);
   }
   memset(original.bloom, 1, ANTI_ENTROPY_BLOOM_BYTES);
 
@@ -447,11 +448,11 @@ protected:
 TEST_F(WireAntiEntropyResponseTest, Roundtrip) {
   wire_anti_entropy_offer_t original = {};
   original.message_id = 0x00FEDA76543210EFULL;
-  node_id_from_string("node-ae-resp-sender", &original.sender_id);
+  anti_entropy_fill_id(&original.sender_id, 0x74, 4);
   original.id_count = 3;
-  node_id_from_string("node-ae-resp-id-a", &original.ids[0]);
-  node_id_from_string("node-ae-resp-id-b", &original.ids[1]);
-  node_id_from_string("node-ae-resp-id-c", &original.ids[2]);
+  anti_entropy_fill_id(&original.ids[0], 0x75, 21);
+  anti_entropy_fill_id(&original.ids[1], 0x75, 22);
+  anti_entropy_fill_id(&original.ids[2], 0x75, 23);
 
   cbor_item_t* encoded = wire_anti_entropy_response_encode(&original);
   ASSERT_NE(encoded, nullptr);
@@ -1104,26 +1105,26 @@ TEST_F(AntiEntropyTest, DigestExchangeConvergesThroughWire) {
   ring_set_t* rings_a = rings;
   ring_set_t* rings_b = ring_set_create(RING_K, RING_M, RING_ALPHA);
 
-  const char* a_names[3] = { "node-ae-a1", "node-ae-a2", "node-ae-a3" };
+  // Distinct ids via the memset helper (node_id_from_string is a base58
+  // decoder that zeroes unknown strings — do not use it for distinct ids).
+  node_id_t a_ids[3];
   net_node_t* a_members[16] = { NULL };
   size_t a_member_count = 0;
   for (int index = 0; index < 3; index++) {
-    node_id_t id;
-    node_id_from_string(a_names[index], &id);
-    a_members[a_member_count] = net_node_create(&id, 0x0A000001, 8080);
+    anti_entropy_fill_id(&a_ids[index], 0x71, index);
+    a_members[a_member_count] = net_node_create(&a_ids[index], 0x0A000001, 8080);
     ASSERT_NE(a_members[a_member_count], nullptr);
     ASSERT_EQ(ring_set_insert(rings_a, a_members[a_member_count],
                               (uint32_t)(5000 * (index + 1))), 0);
     a_member_count++;
   }
 
-  const char* b_names[5] = { "node-ae-b1", "node-ae-b2", "node-ae-b3", "node-ae-b4", "node-ae-b5" };
+  node_id_t b_ids[5];
   net_node_t* b_members[16] = { NULL };
   size_t b_member_count = 0;
   for (int index = 0; index < 5; index++) {
-    node_id_t id;
-    node_id_from_string(b_names[index], &id);
-    b_members[b_member_count] = net_node_create(&id, 0x0B000001, 9080);
+    anti_entropy_fill_id(&b_ids[index], 0x72, index);
+    b_members[b_member_count] = net_node_create(&b_ids[index], 0x0B000001, 9080);
     ASSERT_NE(b_members[b_member_count], nullptr);
     ASSERT_EQ(ring_set_insert(rings_b, b_members[b_member_count],
                               (uint32_t)(6000 * (index + 1))), 0);
@@ -1191,14 +1192,10 @@ TEST_F(AntiEntropyTest, DigestExchangeConvergesThroughWire) {
 
   // Both directions converged: every A id is in B, every B id is in A.
   for (int index = 0; index < 3; index++) {
-    node_id_t id;
-    node_id_from_string(a_names[index], &id);
-    EXPECT_TRUE(ring_set_find_by_id(rings_b, &id) != NULL) << "missing in B: " << a_names[index];
+    EXPECT_TRUE(ring_set_find_by_id(rings_b, &a_ids[index]) != NULL) << "missing in B: index " << index;
   }
   for (int index = 0; index < 5; index++) {
-    node_id_t id;
-    node_id_from_string(b_names[index], &id);
-    EXPECT_TRUE(ring_set_find_by_id(rings_a, &id) != NULL) << "missing in A: " << b_names[index];
+    EXPECT_TRUE(ring_set_find_by_id(rings_a, &b_ids[index]) != NULL) << "missing in A: index " << index;
   }
 
   anti_entropy_destroy_nodes(a_members, a_member_count);
@@ -1210,7 +1207,7 @@ TEST_F(AntiEntropyTest, DigestExchangeCapTruncatesLargeDifference) {
   // A: 1 member. B: 15 members, all disjoint. The offer to A must cap at
   // ANTI_ENTROPY_MAX_IDS even though the true difference is 15.
   node_id_t anchor_id;
-  node_id_from_string("node-ae-cap-anchor", &anchor_id);
+  anti_entropy_fill_id(&anchor_id, 0x76, 1);
   net_node_t* anchor = net_node_create(&anchor_id, 0x0A000001, 8080);
   ASSERT_NE(anchor, nullptr);
   ASSERT_EQ(ring_set_insert(rings, anchor, 5000), 0);
@@ -1218,10 +1215,8 @@ TEST_F(AntiEntropyTest, DigestExchangeCapTruncatesLargeDifference) {
   ring_set_t* rings_b = ring_set_create(RING_K, RING_M, RING_ALPHA);
   net_node_t* b_members[15] = { NULL };
   for (int index = 0; index < 15; index++) {
-    char name[32];
-    snprintf(name, sizeof(name), "node-ae-cap-%02d", index);
     node_id_t id;
-    node_id_from_string(name, &id);
+    anti_entropy_fill_id(&id, 0x77, index);
     b_members[index] = net_node_create(&id, 0x0B000001, 9080);
     ASSERT_NE(b_members[index], nullptr);
     ASSERT_EQ(ring_set_insert(rings_b, b_members[index], (uint32_t)(7000 * (index + 1))), 0);
@@ -1289,7 +1284,7 @@ Expected: green.
 ```bash
 cmake --build build-vg --target testliboffs -j8
 valgrind --leak-check=full --error-exitcode=1 \
-  ./build-vg/testliboffs --gtest_filter='AntiEntropyTest.*:WireAntiEntropy*'
+  ./build-vg/test/testliboffs --gtest_filter='AntiEntropyTest.*:WireAntiEntropy*'
 ```
 
 Expected: 0 definitely-lost/indirectly-lost blocks. The valgrind error catalog in memory lists known pre-existing issues (scheduler shutdown invalid-read, etc.) — anything new pointing at `anti_entropy`, `wire_anti_entropy`, or the new `network.c` handlers is a plan bug; fix it.

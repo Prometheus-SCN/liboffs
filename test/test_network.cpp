@@ -16,6 +16,7 @@ extern "C" {
 #include "Network/network.h"
 #include "Network/query.h"
 #include "Network/gossip.h"
+#include "Network/anti_entropy.h"
 #include "Network/ring.h"
 #include "Network/ring_set.h"
 #include "Network/latency_cache.h"
@@ -4675,4 +4676,99 @@ TEST_F(OrphanedDirectHealTest, SalutatedDirectPeerStaysDirectOnTick) {
 
   EXPECT_EQ(peer->conn_state, CONN_STATE_DIRECT);
   EXPECT_EQ(peer->direct_path.active, 1);
+}
+
+// === Anti-entropy digest bloom + novel-id collection ===
+
+static void anti_entropy_destroy_nodes(net_node_t* const* members, size_t count) {
+  for (size_t index = 0; index < count; index++) {
+    net_node_destroy(members[index]);
+  }
+}
+
+// Deterministic distinct ids: node_id_from_string needs valid 32-byte base58
+// and clears the id on failure, so fill the hash directly (marker separates
+// member ids from absent-probe ids; index keeps the set distinct).
+static void anti_entropy_fill_id(node_id_t* id, uint8_t marker, int index) {
+  memset(id, 0, sizeof(*id));
+  id->hash[0] = marker;
+  id->hash[1] = (uint8_t)(index & 0xFF);
+  id->hash[2] = (uint8_t)((index >> 8) & 0xFF);
+}
+
+class AntiEntropyTest : public ::testing::Test {
+protected:
+  ring_set_t* rings;
+
+  void SetUp() override {
+    rings = ring_set_create(RING_K, RING_M, RING_ALPHA);
+  }
+
+  void TearDown() override {
+    ring_set_destroy(rings);
+  }
+};
+
+TEST_F(AntiEntropyTest, BloomBuildMatchesInsertedMembers) {
+  net_node_t* members[3] = { NULL, NULL, NULL };
+  for (int index = 0; index < 3; index++) {
+    node_id_t id;
+    anti_entropy_fill_id(&id, 0x51, index);
+    members[index] = net_node_create(&id, 0x0A000001, 8080);
+    ASSERT_NE(members[index], nullptr);
+    ASSERT_EQ(ring_set_insert(rings, members[index], (uint32_t)(5000 * (index + 1))), 0);
+  }
+
+  uint8_t bloom[ANTI_ENTROPY_BLOOM_BYTES] = {};
+  size_t count = anti_entropy_bloom_build(rings, bloom);
+  EXPECT_EQ(count, 3u);
+
+  for (int index = 0; index < 3; index++) {
+    EXPECT_TRUE(anti_entropy_bloom_check(bloom, &members[index]->id));
+  }
+
+  anti_entropy_destroy_nodes(members, 3);
+}
+
+TEST_F(AntiEntropyTest, BloomEmptySetBuildsZeroFilter) {
+  uint8_t bloom[ANTI_ENTROPY_BLOOM_BYTES] = {};
+  EXPECT_EQ(anti_entropy_bloom_build(rings, bloom), 0u);
+  for (size_t byte_index = 0; byte_index < ANTI_ENTROPY_BLOOM_BYTES; byte_index++) {
+    ASSERT_EQ(bloom[byte_index], 0) << "byte " << byte_index;
+  }
+}
+
+TEST_F(AntiEntropyTest, BloomFalsePositiveRateSane) {
+  node_id_t member_ids[120];
+  net_node_t* members[120];
+  // Each ring holds 8 primary + 4 secondary = 12 members; a fixed latency
+  // would park all 120 in one ring and overflow after 12 inserts, so cycle
+  // the latency across all 10 rings (12 members each) to fill the set.
+  for (int index = 0; index < 120; index++) {
+    int ring_slot = index % 10;
+    uint32_t latency_us = (ring_slot == 0) ? 1000u
+        : (uint32_t)(5000u << (ring_slot - 1));
+    anti_entropy_fill_id(&member_ids[index], 0x52, index);
+    members[index] = net_node_create(&member_ids[index], 0x0A000001, 8080);
+    ASSERT_NE(members[index], nullptr);
+    ASSERT_EQ(ring_set_insert(rings, members[index], latency_us), 0);
+  }
+
+  uint8_t bloom[ANTI_ENTROPY_BLOOM_BYTES] = {};
+  ASSERT_EQ(anti_entropy_bloom_build(rings, bloom), 120u);
+
+  node_id_t absent_id;
+  int false_positives = 0;
+  for (int index = 0; index < 200; index++) {
+    anti_entropy_fill_id(&absent_id, 0x53, index);
+    if (anti_entropy_bloom_check(bloom, &absent_id)) false_positives++;
+  }
+  // Every inserted member must test present.
+  for (int index = 0; index < 120; index++) {
+    EXPECT_TRUE(anti_entropy_bloom_check(bloom, &member_ids[index]));
+  }
+  // Expected FP at m=4096 bits, k=3, n=120 is ~0.06% per probe (~0.12 of 200).
+  EXPECT_LE(false_positives, 2);
+
+  anti_entropy_destroy_nodes(members, 120);
 }

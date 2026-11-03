@@ -1166,8 +1166,11 @@ TEST_F(AntiEntropyTest, DigestExchangeConvergesThroughWire) {
   // Leg 3: A collects its ids absent in B's filter.
   node_id_t response_ids[ANTI_ENTROPY_MAX_IDS];
   size_t response_count = anti_entropy_collect_novel(rings_a, bloom_b, response_ids, ANTI_ENTROPY_MAX_IDS);
-  EXPECT_EQ(response_count, 8u);  // A's 3 originals + the 5 just inserted; B has none
-  EXPECT_LE(response_count, (size_t)ANTI_ENTROPY_MAX_IDS);
+  // The 5 just-inserted ids ARE B's own member ids, so they test PRESENT
+  // in bloom_b (built from exactly those members). Only A's 3 originals
+  // are novel to B. (An 8 here would mean the exchange re-sends ids the
+  // peer already has.)
+  EXPECT_EQ(response_count, 3u);
 
   wire_anti_entropy_offer_t response = {};
   response.message_id = 0x1000000000000002ULL;

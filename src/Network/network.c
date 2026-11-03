@@ -20,6 +20,7 @@
 #include "topology_metrics.h"
 #include "topology_report.h"
 #include "ring_set.h"
+#include "anti_entropy.h"
 #include "wanted_list.h"
 #include "relay_client.h"
 #include "nat_detect.h"
@@ -35,6 +36,7 @@
 #include "../Buffer/buffer.h"
 #include "../Metrics/metrics.h"
 #include "../Platform/platform_time.h"
+#include "../Platform/platform_random.h"
 #include "../RefCounter/refcounter.h"
 #include "../Util/allocator.h"
 #include "../Util/log.h"
@@ -133,6 +135,10 @@ static void network_handle_measure_nodes(network_t* network, message_t* msg);
 static void network_handle_measure_nodes_response(network_t* network, message_t* msg);
 static void network_handle_closest_nodes_progress(network_t* network, message_t* msg);
 static void network_handle_local_closest_nodes(network_t* network, message_t* msg);
+static void network_handle_anti_entropy_tick(network_t* network, message_t* msg);
+static void network_handle_anti_entropy_received(network_t* network, message_t* msg);
+static void network_handle_anti_entropy_offer_received(network_t* network, message_t* msg);
+static void network_handle_anti_entropy_response_received(network_t* network, message_t* msg);
 
 /* Forward declarations for the PUNCH handlers (audit #18 — ICE simultaneous
    open for symmetric NAT). Defined later in this file. */
@@ -2376,6 +2382,149 @@ static void network_handle_gossip_pull_received(network_t* network, message_t* m
   }
 
   // No response — this is the pull half of PUSHPULL
+}
+
+// --- Anti-entropy (ring-membership divergence repair) ---
+// Three-leg digest/offer/response exchange with one random connected peer
+// per tick. Novel ids per exchange are capped at ANTI_ENTROPY_MAX_IDS by
+// anti_entropy_collect_novel; network_add_node_to_ring skips already-known
+// ids, so cap consumption is genuinely-novel-only.
+
+static peer_connection_t* network_pick_random_connected_peer(network_t* network) {
+  size_t connected_count = 0;
+  for (size_t index = 0; index < network->conn_mgr.peer_count; index++) {
+    peer_connection_t* candidate = network->conn_mgr.peers[index];
+    if (candidate != NULL && candidate->connected) connected_count++;
+  }
+  if (connected_count == 0) return NULL;
+
+  size_t pick = platform_random_uniform_index(connected_count);
+  size_t passed = 0;
+  for (size_t index = 0; index < network->conn_mgr.peer_count; index++) {
+    peer_connection_t* candidate = network->conn_mgr.peers[index];
+    if (candidate == NULL || !candidate->connected) continue;
+    if (passed == pick) return candidate;
+    passed++;
+  }
+  // Unreachable: connected_count entries were counted in the first pass.
+  return NULL;
+}
+
+static void network_handle_anti_entropy_tick(network_t* network, message_t* msg) {
+  (void)msg;
+  if (network->rings == NULL) return;
+
+  peer_connection_t* peer = network_pick_random_connected_peer(network);
+  if (peer == NULL) return;
+
+  wire_anti_entropy_t digest;
+  memset(&digest, 0, sizeof(digest));
+  digest.message_id = gossip_handle_next_query_id(&network->gossip);
+  memcpy(&digest.sender_id, &network->authority->local_id, sizeof(node_id_t));
+  // An empty ring set still sends: the filter is all-zero and the peer
+  // offers its full membership list up to the cap.
+  size_t member_count = anti_entropy_bloom_build(network->rings, digest.bloom);
+  digest.member_count = (uint8_t)member_count;
+
+  cbor_item_t* cbor = wire_anti_entropy_encode(&digest);
+  int send_rc = conn_state_send(network, peer, cbor);
+  cbor_decref(&cbor);
+  if (send_rc != 0) return;
+
+  if (network->log != NULL) {
+    message_log_record(network->log, WIRE_ANTI_ENTROPY, MSG_DIRECTION_SENT,
+                       &peer->remote_node_id, digest.message_id, NULL,
+                       0, &network->hebbian);
+  }
+}
+
+static void network_handle_anti_entropy_received(network_t* network, message_t* msg) {
+  wire_anti_entropy_t* digest = (wire_anti_entropy_t*)msg->payload;
+  if (digest == NULL) return;
+
+  if (network->log != NULL) {
+    message_log_record(network->log, WIRE_ANTI_ENTROPY, MSG_DIRECTION_RECEIVED,
+                       &digest->sender_id, digest->message_id, NULL,
+                       0, &network->hebbian);
+  }
+
+  peer_connection_t* peer = connection_manager_lookup(&network->conn_mgr, &digest->sender_id);
+  if (peer == NULL || !peer->connected) return;
+
+  wire_anti_entropy_offer_t offer;
+  memset(&offer, 0, sizeof(offer));
+  offer.message_id = gossip_handle_next_query_id(&network->gossip);
+  memcpy(&offer.sender_id, &network->authority->local_id, sizeof(node_id_t));
+
+  (void)anti_entropy_bloom_build(network->rings, offer.bloom);
+  offer.id_count = (uint8_t)anti_entropy_collect_novel(
+      network->rings, digest->bloom, offer.ids, ANTI_ENTROPY_MAX_IDS);
+
+  cbor_item_t* cbor = wire_anti_entropy_offer_encode(&offer);
+  conn_state_send(network, peer, cbor);
+  cbor_decref(&cbor);
+
+  if (network->log != NULL) {
+    message_log_record(network->log, WIRE_ANTI_ENTROPY_OFFER, MSG_DIRECTION_SENT,
+                       &peer->remote_node_id, offer.message_id, NULL,
+                       0, &network->hebbian);
+  }
+}
+
+static void network_handle_anti_entropy_offer_received(network_t* network, message_t* msg) {
+  wire_anti_entropy_offer_t* offer = (wire_anti_entropy_offer_t*)msg->payload;
+  if (offer == NULL) return;
+
+  if (network->log != NULL) {
+    message_log_record(network->log, WIRE_ANTI_ENTROPY_OFFER, MSG_DIRECTION_RECEIVED,
+                       &offer->sender_id, offer->message_id, NULL,
+                       0, &network->hebbian);
+  }
+
+  // The id count is already clamped by the decoder; network_add_node_to_ring
+  // skips already-known ids, so at most ANTI_ENTROPY_MAX_IDS new insertions.
+  for (uint8_t index = 0;
+       index < offer->id_count && index < ANTI_ENTROPY_MAX_IDS;
+       index++) {
+    network_add_node_to_ring(network, &offer->ids[index], 0, 0, NULL);
+  }
+
+  peer_connection_t* peer = connection_manager_lookup(&network->conn_mgr, &offer->sender_id);
+  if (peer == NULL || !peer->connected) return;
+
+  wire_anti_entropy_offer_t response;
+  memset(&response, 0, sizeof(response));
+  response.message_id = gossip_handle_next_query_id(&network->gossip);
+  memcpy(&response.sender_id, &network->authority->local_id, sizeof(node_id_t));
+  response.id_count = (uint8_t)anti_entropy_collect_novel(
+      network->rings, offer->bloom, response.ids, ANTI_ENTROPY_MAX_IDS);
+
+  cbor_item_t* cbor = wire_anti_entropy_response_encode(&response);
+  conn_state_send(network, peer, cbor);
+  cbor_decref(&cbor);
+
+  if (network->log != NULL) {
+    message_log_record(network->log, WIRE_ANTI_ENTROPY_RESPONSE, MSG_DIRECTION_SENT,
+                       &peer->remote_node_id, response.message_id, NULL,
+                       0, &network->hebbian);
+  }
+}
+
+static void network_handle_anti_entropy_response_received(network_t* network, message_t* msg) {
+  wire_anti_entropy_offer_t* response = (wire_anti_entropy_offer_t*)msg->payload;
+  if (response == NULL) return;
+
+  if (network->log != NULL) {
+    message_log_record(network->log, WIRE_ANTI_ENTROPY_RESPONSE, MSG_DIRECTION_RECEIVED,
+                       &response->sender_id, response->message_id, NULL,
+                       0, &network->hebbian);
+  }
+
+  for (uint8_t index = 0;
+       index < response->id_count && index < ANTI_ENTROPY_MAX_IDS;
+       index++) {
+    network_add_node_to_ring(network, &response->ids[index], 0, 0, NULL);
+  }
 }
 
 // --- ClosestNodes handler ---
@@ -5143,6 +5292,9 @@ void network_dispatch(void* state, message_t* msg) {
     case NETWORK_GOSSIP_TICK:
       network_handle_gossip_tick(network, msg);
       break;
+    case NETWORK_ANTI_ENTROPY_TICK:
+      network_handle_anti_entropy_tick(network, msg);
+      break;
     case NETWORK_REQUEST_TIMEOUT_TICK:
       network_handle_request_timeout_tick(network, msg);
       break;
@@ -5515,6 +5667,42 @@ void network_dispatch(void* state, message_t* msg) {
             if (wire_gossip_pull_decode(wire_msg, payload) == 0) {
               dispatch_msg.payload = payload;
               network_handle_gossip_pull_received(network, &dispatch_msg);
+            } else {
+              free(payload);
+            }
+          }
+          break;
+        }
+        case WIRE_ANTI_ENTROPY: {
+          wire_anti_entropy_t* payload = get_clear_memory(sizeof(wire_anti_entropy_t));
+          if (payload != NULL) {
+            if (wire_anti_entropy_decode(wire_msg, payload) == 0) {
+              dispatch_msg.payload = payload;
+              network_handle_anti_entropy_received(network, &dispatch_msg);
+            } else {
+              free(payload);
+            }
+          }
+          break;
+        }
+        case WIRE_ANTI_ENTROPY_OFFER: {
+          wire_anti_entropy_offer_t* payload = get_clear_memory(sizeof(wire_anti_entropy_offer_t));
+          if (payload != NULL) {
+            if (wire_anti_entropy_offer_decode(wire_msg, payload) == 0) {
+              dispatch_msg.payload = payload;
+              network_handle_anti_entropy_offer_received(network, &dispatch_msg);
+            } else {
+              free(payload);
+            }
+          }
+          break;
+        }
+        case WIRE_ANTI_ENTROPY_RESPONSE: {
+          wire_anti_entropy_offer_t* payload = get_clear_memory(sizeof(wire_anti_entropy_offer_t));
+          if (payload != NULL) {
+            if (wire_anti_entropy_response_decode(wire_msg, payload) == 0) {
+              dispatch_msg.payload = payload;
+              network_handle_anti_entropy_response_received(network, &dispatch_msg);
             } else {
               free(payload);
             }
@@ -6248,6 +6436,42 @@ void network_dispatch(void* state, message_t* msg) {
               if (wire_gossip_pull_decode(wire_msg, payload) == 0) {
                 dispatch_msg.payload = payload;
                 network_handle_gossip_pull_received(network, &dispatch_msg);
+              } else {
+                free(payload);
+              }
+            }
+            break;
+          }
+          case WIRE_ANTI_ENTROPY: {
+            wire_anti_entropy_t* payload = get_clear_memory(sizeof(wire_anti_entropy_t));
+            if (payload != NULL) {
+              if (wire_anti_entropy_decode(wire_msg, payload) == 0) {
+                dispatch_msg.payload = payload;
+                network_handle_anti_entropy_received(network, &dispatch_msg);
+              } else {
+                free(payload);
+              }
+            }
+            break;
+          }
+          case WIRE_ANTI_ENTROPY_OFFER: {
+            wire_anti_entropy_offer_t* payload = get_clear_memory(sizeof(wire_anti_entropy_offer_t));
+            if (payload != NULL) {
+              if (wire_anti_entropy_offer_decode(wire_msg, payload) == 0) {
+                dispatch_msg.payload = payload;
+                network_handle_anti_entropy_offer_received(network, &dispatch_msg);
+              } else {
+                free(payload);
+              }
+            }
+            break;
+          }
+          case WIRE_ANTI_ENTROPY_RESPONSE: {
+            wire_anti_entropy_offer_t* payload = get_clear_memory(sizeof(wire_anti_entropy_offer_t));
+            if (payload != NULL) {
+              if (wire_anti_entropy_response_decode(wire_msg, payload) == 0) {
+                dispatch_msg.payload = payload;
+                network_handle_anti_entropy_response_received(network, &dispatch_msg);
               } else {
                 free(payload);
               }

@@ -58,6 +58,11 @@ typedef struct rate_limit_table_t {
   size_t max_count;               // Cap; evict oldest (lowest last_refill) entry when reached. 0 = no cap. See audit #14.
   size_t peer_count;              // Current network peer count for inverse scaling
   size_t reference_peer_count;    // Network size at which base rates apply as-is (default 32)
+  /* Effective per-type configs, mutable at runtime (config surface / config
+     update). Initialized from RATE_LIMIT_DEFAULTS; every check/charge/retry
+     reads these instead of the compiled defaults so a live config change
+     takes effect without a daemon restart. */
+  token_bucket_config_t configs[RPC_TYPE_COUNT];
 } rate_limit_table_t;
 
 // Initialize/deinitialize rate limit table
@@ -109,5 +114,22 @@ void rate_limit_charge(rate_limit_table_t* table, const node_id_t* peer_id,
 // If 0.50-0.80 → linear taper
 // Otherwise 1.0
 float rate_limit_capacity_multiplier(float capacity, rpc_type_e type);
+
+// Replace the table's effective per-type configs. A max_rate or burst_size
+// below 0 is invalid and keeps the table's current value for that type; 0 is
+// a legal hard value (e.g. a zero refill freezes the type) but cannot be
+// expressed through the config surface, where 0 means "compiled default" —
+// build such lists with rate_limit_configs_merge. Existing peer buckets keep
+// their current token counts; the new rates apply on the next refill.
+void rate_limit_table_set_configs(rate_limit_table_t* table,
+                                  const token_bucket_config_t configs[RPC_TYPE_COUNT]);
+
+// Build a full config list from sparse overrides: a rates[i] <= 0 (or
+// bursts[i] <= 0) keeps RATE_LIMIT_DEFAULTS for that field. Index order is
+// config.h CONFIG_RATE_TYPE_COUNT = rpc_type_e. NULL arrays keep all
+// defaults. Used by the network layer to translate the config surface.
+void rate_limit_configs_merge(const float rates[RPC_TYPE_COUNT],
+                              const float bursts[RPC_TYPE_COUNT],
+                              token_bucket_config_t out[RPC_TYPE_COUNT]);
 
 #endif // OFFS_RATE_LIMIT_H

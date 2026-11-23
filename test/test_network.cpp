@@ -2019,6 +2019,112 @@ TEST_F(RateLimitTest, SetPeerCount) {
   EXPECT_EQ(table.peer_count, 32u);
 }
 
+TEST_F(RateLimitTest, InitCopiesDefaultConfigs) {
+  for (int config_index = 0; config_index < RPC_TYPE_COUNT; config_index++) {
+    EXPECT_FLOAT_EQ(table.configs[config_index].max_rate,
+                    RATE_LIMIT_DEFAULTS[config_index].max_rate);
+    EXPECT_FLOAT_EQ(table.configs[config_index].burst_size,
+                    RATE_LIMIT_DEFAULTS[config_index].burst_size);
+    EXPECT_FLOAT_EQ(table.configs[config_index].cost,
+                    RATE_LIMIT_DEFAULTS[config_index].cost);
+  }
+}
+
+TEST_F(RateLimitTest, SetConfigsOverridesBucketRefill) {
+  token_bucket_config_t overrides[RPC_TYPE_COUNT];
+  memcpy(overrides, RATE_LIMIT_DEFAULTS, sizeof(overrides));
+  overrides[RPC_TYPE_FIND_BLOCK].max_rate = 0.0f;   // refill stops entirely
+  overrides[RPC_TYPE_FIND_BLOCK].burst_size = 10.0f;
+  rate_limit_table_set_configs(&table, overrides);
+
+  node_id_t peer = {};
+  memset(peer.hash, 0x11, NODE_ID_HASH_SIZE);
+
+  // Drain the bucket fully, then wait far longer than the default would
+  // take to refill: with max_rate 0 no refill can happen, so the next
+  // check must reject despite the wait — proof the override is live.
+  peer_rate_limits_t* limits = rate_limit_table_get(&table, &peer);
+  ASSERT_NE(limits, nullptr);
+  limits->buckets[RPC_TYPE_FIND_BLOCK].tokens = 0.0f;
+  limits->buckets[RPC_TYPE_FIND_BLOCK].last_refill = 1000;
+
+  bool allowed = rate_limit_check(&table, &peer, RPC_TYPE_FIND_BLOCK, 600000);
+  EXPECT_FALSE(allowed);
+  EXPECT_FLOAT_EQ(limits->buckets[RPC_TYPE_FIND_BLOCK].tokens, 0.0f);
+}
+
+TEST_F(RateLimitTest, SetConfigsThenRestoreDefault) {
+  token_bucket_config_t overrides[RPC_TYPE_COUNT];
+  memcpy(overrides, RATE_LIMIT_DEFAULTS, sizeof(overrides));
+  overrides[RPC_TYPE_SEEKING_BLOCKS].max_rate = 0.0f;
+  rate_limit_table_set_configs(&table, overrides);
+  EXPECT_FLOAT_EQ(table.configs[RPC_TYPE_SEEKING_BLOCKS].max_rate, 0.0f);
+
+  // Re-applying the untouched defaults restores the table config.
+  rate_limit_table_set_configs(&table, RATE_LIMIT_DEFAULTS);
+  EXPECT_FLOAT_EQ(table.configs[RPC_TYPE_SEEKING_BLOCKS].max_rate,
+                  RATE_LIMIT_DEFAULTS[RPC_TYPE_SEEKING_BLOCKS].max_rate);
+}
+
+TEST_F(RateLimitTest, SetConfigsIgnoresInvalidEntries) {
+  token_bucket_config_t partial[RPC_TYPE_COUNT];
+  memcpy(partial, RATE_LIMIT_DEFAULTS, sizeof(partial));
+  partial[RPC_TYPE_FIND_BLOCK].max_rate = -1.0f;  // invalid → keep previous
+  partial[RPC_TYPE_PING].burst_size = -5.0f;      // invalid → keep previous
+  rate_limit_table_set_configs(&table, partial);
+
+  EXPECT_FLOAT_EQ(table.configs[RPC_TYPE_FIND_BLOCK].max_rate,
+                  RATE_LIMIT_DEFAULTS[RPC_TYPE_FIND_BLOCK].max_rate);
+  EXPECT_FLOAT_EQ(table.configs[RPC_TYPE_PING].burst_size,
+                  RATE_LIMIT_DEFAULTS[RPC_TYPE_PING].burst_size);
+}
+
+TEST_F(RateLimitTest, ConfigMergeAppliesOverridesPerType) {
+  float rates[RPC_TYPE_COUNT] = {0};
+  float bursts[RPC_TYPE_COUNT] = {0};
+  rates[RPC_TYPE_FIND_BLOCK] = 25.0f;
+  bursts[RPC_TYPE_FIND_BLOCK] = 120.0f;
+  rates[RPC_TYPE_STORE_BLOCK] = 2.0f;
+
+  token_bucket_config_t merged[RPC_TYPE_COUNT];
+  rate_limit_configs_merge(rates, bursts, merged);
+
+  EXPECT_FLOAT_EQ(merged[RPC_TYPE_FIND_BLOCK].max_rate, 25.0f);
+  EXPECT_FLOAT_EQ(merged[RPC_TYPE_FIND_BLOCK].burst_size, 120.0f);
+  EXPECT_FLOAT_EQ(merged[RPC_TYPE_FIND_BLOCK].cost,
+                  RATE_LIMIT_DEFAULTS[RPC_TYPE_FIND_BLOCK].cost);
+  EXPECT_FLOAT_EQ(merged[RPC_TYPE_STORE_BLOCK].max_rate, 2.0f);
+  EXPECT_FLOAT_EQ(merged[RPC_TYPE_STORE_BLOCK].burst_size,
+                  RATE_LIMIT_DEFAULTS[RPC_TYPE_STORE_BLOCK].burst_size);
+  EXPECT_FLOAT_EQ(merged[RPC_TYPE_PING].max_rate,
+                  RATE_LIMIT_DEFAULTS[RPC_TYPE_PING].max_rate);
+}
+
+TEST_F(RateLimitTest, ConfigMergeAllZeroKeepsDefaults) {
+  float rates[RPC_TYPE_COUNT] = {0};
+  float bursts[RPC_TYPE_COUNT] = {0};
+  token_bucket_config_t merged[RPC_TYPE_COUNT];
+  rate_limit_configs_merge(rates, bursts, merged);
+  for (int config_index = 0; config_index < RPC_TYPE_COUNT; config_index++) {
+    EXPECT_FLOAT_EQ(merged[config_index].max_rate,
+                    RATE_LIMIT_DEFAULTS[config_index].max_rate);
+    EXPECT_FLOAT_EQ(merged[config_index].burst_size,
+                    RATE_LIMIT_DEFAULTS[config_index].burst_size);
+  }
+}
+
+TEST_F(RateLimitTest, SetPeerCountScalesOverriddenConfig) {
+  token_bucket_config_t overrides[RPC_TYPE_COUNT];
+  memcpy(overrides, RATE_LIMIT_DEFAULTS, sizeof(overrides));
+  overrides[RPC_TYPE_FIND_BLOCK].max_rate = 25.0f;
+  rate_limit_table_set_configs(&table, overrides);
+  rate_limit_table_set_peer_count(&table, 32);
+  EXPECT_FLOAT_EQ(rate_limit_effective_rate(&table, RPC_TYPE_FIND_BLOCK), 25.0f);
+  rate_limit_table_set_peer_count(&table, 4);
+  // (32/4)*3 = 24x the overridden base
+  EXPECT_FLOAT_EQ(rate_limit_effective_rate(&table, RPC_TYPE_FIND_BLOCK), 600.0f);
+}
+
 TEST_F(RateLimitTest, EffectiveRateInverseScaling) {
   // At reference count (32), rates should be base rates
   rate_limit_table_set_peer_count(&table, 32);

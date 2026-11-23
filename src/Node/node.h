@@ -43,4 +43,17 @@ void offs_node_destroy(offs_node_t* node);
    Must only be called from a local transport handler. */
 void offs_node_restart(offs_node_t* node, const char* data_dir);
 
+/* Live-apply peer rate-limit overrides from a staged config JSON object
+   (the parsed body of a config PUT — a cJSON object, passed opaque to keep
+   cJSON out of this header). Recognized keys: rate_<type> and
+   rate_<type>_burst — see config.h CONFIG_RATE_TYPE_COUNT ordering
+   (find_block, store_block, seeking_blocks, ping_capacity, ping). Values
+   <= 0 keep the compiled default for that type. Returns the number of fields
+   applied, or -1 when a rate field carries an invalid value (a
+   rate_-prefixed field that is not a number or is negative); nothing is
+   applied in that case. Does NOT mutate node->config — persistence rides
+   the pending-config path so a restart reproduces the same values. */
+int offs_node_apply_rate_configs_from_json(offs_node_t* node,
+                                           const void* json_object);
+
 #endif // OFFS_NODE_H

@@ -91,24 +91,48 @@ void config_handle_set_request(config_handler_ctx_t* ctx, cbor_item_t* frame) {
     } else {
       cJSON* obj = cJSON_CreateObject();
       cJSON_AddItemToObject(obj, req.field, value);
-      char* obj_str = cJSON_PrintUnformatted(obj);
-      cJSON_Delete(obj);
-      if (obj_str == NULL) {
+      bool is_burst = false;
+      bool is_rate_field = config_rate_field_index(req.field, &is_burst) >= 0;
+      if (is_rate_field && cJSON_IsNumber(value) && value->valuedouble < 0.0) {
+        cJSON_Delete(obj);
         resp.status = 1;
-        resp.message = strdup("failed to serialize config");
+        resp.message = strdup("rate fields must be >= 0");
       } else {
-        int rc = config_pending_save(ctx->data_dir, obj_str, strlen(obj_str));
-        free(obj_str);
-        if (rc == 0) {
-          /* Pending config only applies on restart, so every successful stage
-             requires a restart to take effect. */
-          resp.status = 0;
-          resp.restart_required = 1;
-          resp.message = strdup("staged; restart to apply");
-        } else {
+        char* obj_str = cJSON_PrintUnformatted(obj);
+        int live_applied = 0;
+        if (obj_str == NULL) {
           resp.status = 1;
-          resp.message = strdup("failed to write pending config");
+          resp.message = strdup("failed to serialize config");
+        } else {
+          int rc = config_pending_save(ctx->data_dir, obj_str, strlen(obj_str));
+          free(obj_str);
+          if (rc == 0) {
+            if (is_rate_field && cJSON_IsNumber(value)) {
+              live_applied = offs_node_apply_rate_configs_from_json(ctx->node, obj);
+            }
+            resp.status = 0;
+            if (live_applied > 0) {
+              /* Rate fields apply through the network actor immediately; the
+                 pending file keeps the same values so a restart reproduces
+                 them consistently. */
+              resp.restart_required = 0;
+              resp.message = strdup("applied live; staged for restart consistency");
+            } else if (live_applied == 0) {
+              /* Rate field staged but nothing to apply live (the network is
+                 not running) — the pending config governs on restart. */
+              resp.restart_required = 1;
+              resp.message = strdup("staged; restart to apply");
+            } else {
+              /* Every non-rate field applies on restart only. */
+              resp.restart_required = 1;
+              resp.message = strdup("staged; restart to apply");
+            }
+          } else {
+            resp.status = 1;
+            resp.message = strdup("failed to write pending config");
+          }
         }
+        cJSON_Delete(obj);
       }
     }
   }

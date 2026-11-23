@@ -27,7 +27,13 @@ static const char* _bool_fields[] = {
 static const char* _number_fields[] = {
   "cache_size", "max_snapshots", "max_wals", "max_capacity_bytes",
   "scheduler_thread_count", "http_port", "https_port",
-  "tcp_port", "ws_port", "wt_port", NULL
+  "tcp_port", "ws_port", "wt_port",
+  /* Peer rate limits (hot-applied — see config_handlers "applied" path): */
+  "rate_find_block", "rate_find_block_burst",
+  "rate_store_block", "rate_store_block_burst",
+  "rate_seeking_blocks", "rate_seeking_blocks_burst",
+  "rate_ping_capacity", "rate_ping_capacity_burst",
+  "rate_ping", "rate_ping_burst", NULL
 };
 
 static bool _in_list(const char* name, const char* const* list) {
@@ -50,8 +56,50 @@ config_field_type_t config_field_type(const char* name) {
   return CONFIG_FIELD_NUMBER;
 }
 
+int config_rate_field_index(const char* name, bool* is_burst) {
+  static const char* _rate_type_names[] = {
+    "find_block", "store_block", "seeking_blocks",
+    "ping_capacity", "ping", NULL
+  };
+  *is_burst = false;
+  if (name == NULL || strncmp(name, "rate_", 5) != 0) return -1;
+  const char* suffix = name + 5;
+  size_t suffix_len = strlen(suffix);
+  if (suffix_len > 6 && strncmp(suffix + suffix_len - 6, "_burst", 6) == 0) {
+    *is_burst = true;
+    suffix_len -= 6;
+  }
+  for (size_t index = 0; _rate_type_names[index] != NULL; index++) {
+    if (strlen(_rate_type_names[index]) == suffix_len &&
+        strncmp(suffix, _rate_type_names[index], suffix_len) == 0) {
+      return (int)index;
+    }
+  }
+  *is_burst = false;
+  return -1;
+}
+
 cJSON* config_to_json(const config_t* config) {
   cJSON* root = cJSON_CreateObject();
+
+  static const char* _rate_field_names[CONFIG_RATE_TYPE_COUNT + 1] = {
+    "find_block", "store_block", "seeking_blocks",
+    "ping_capacity", "ping", NULL
+  };
+
+  for (size_t rate_index = 0; rate_index < CONFIG_RATE_TYPE_COUNT &&
+                              _rate_field_names[rate_index] != NULL; rate_index++) {
+    if (config->rate_limit_rates[rate_index] > 0.0f) {
+      char rate_field[48];
+      snprintf(rate_field, sizeof(rate_field), "rate_%s", _rate_field_names[rate_index]);
+      cJSON_AddNumberToObject(root, rate_field, (double)config->rate_limit_rates[rate_index]);
+    }
+    if (config->rate_limit_bursts[rate_index] > 0.0f) {
+      char burst_field[48];
+      snprintf(burst_field, sizeof(burst_field), "rate_%s_burst", _rate_field_names[rate_index]);
+      cJSON_AddNumberToObject(root, burst_field, (double)config->rate_limit_bursts[rate_index]);
+    }
+  }
 
   cJSON_AddNumberToObject(root, "cache_size", (double)config->cache_size);
   cJSON_AddNumberToObject(root, "max_snapshots", (double)config->max_snapshots);

@@ -1587,6 +1587,12 @@ network_t* network_create(authority_t* authority, block_cache_t* block_cache,
   }
   rate_limit_table_init(&network->rate_limits, 32);
   rate_limit_table_set_max_count(&network->rate_limits, 1024);
+  if (config != NULL) {
+    token_bucket_config_t merged_configs[RPC_TYPE_COUNT];
+    rate_limit_configs_merge(config->rate_limit_rates, config->rate_limit_bursts,
+                             merged_configs);
+    rate_limit_table_set_configs(&network->rate_limits, merged_configs);
+  }
   eabf_table_set_max_count(&network->eabf_table, 256);
   network->log = NULL;
   network->topology_metrics = topology_metrics_create(pool);
@@ -2029,6 +2035,32 @@ int network_connect_relay(network_t* network, const char* host, uint16_t port) {
     return -1;
   }
 
+  return 0;
+}
+
+int network_apply_rate_configs(network_t* network,
+                               const float rates[5],
+                               const float bursts[5]) {
+  if (network == NULL) return -1;
+  network_apply_rates_payload_t* payload =
+      get_clear_memory(sizeof(network_apply_rates_payload_t));
+  if (payload == NULL) return -1;
+  if (rates != NULL) {
+    memcpy(payload->rates, rates, sizeof(payload->rates));
+  }
+  if (bursts != NULL) {
+    memcpy(payload->bursts, bursts, sizeof(payload->bursts));
+  }
+  message_t apply_msg;
+  memset(&apply_msg, 0, sizeof(apply_msg));
+  apply_msg.type = NETWORK_APPLY_RATES;
+  apply_msg.payload = payload;
+  apply_msg.payload_destroy = free;
+  /* actor_send's return is the was_empty scheduling hint, not an error —
+     the message is queued unless the actor was destroyed, in which case
+     actor_send already freed the payload. Never free here; ownership
+     transfers unconditionally. */
+  actor_send(&network->actor, &apply_msg);
   return 0;
 }
 
@@ -6807,6 +6839,21 @@ void network_dispatch(void* state, message_t* msg) {
     case NETWORK_GOSSIP_PULL_RECEIVED:
       network_handle_gossip_pull_received(network, msg);
       break;
+    case NETWORK_APPLY_RATES: {
+      network_apply_rates_payload_t* apply =
+          (network_apply_rates_payload_t*)msg->payload;
+      if (apply == NULL) break;
+      token_bucket_config_t merged_configs[RPC_TYPE_COUNT];
+      rate_limit_configs_merge(apply->rates, apply->bursts, merged_configs);
+      rate_limit_table_set_configs(&network->rate_limits, merged_configs);
+      log_info("network: rate limits applied live — find=%.1f/s burst=%.1f "
+               "store=%.1f/s seeking=%.1f/s",
+               rate_limit_effective_rate(&network->rate_limits, RPC_TYPE_FIND_BLOCK),
+               merged_configs[RPC_TYPE_FIND_BLOCK].burst_size,
+               rate_limit_effective_rate(&network->rate_limits, RPC_TYPE_STORE_BLOCK),
+               rate_limit_effective_rate(&network->rate_limits, RPC_TYPE_SEEKING_BLOCKS));
+      break;
+    }
     case NETWORK_METRICS_PUSH: {
       size_t peer_count = connection_manager_count(&network->conn_mgr);
       rate_limit_table_set_peer_count(&network->rate_limits, peer_count);

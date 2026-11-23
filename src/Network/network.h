@@ -280,11 +280,34 @@ typedef struct {
   ATOMIC(bool) done_flag;
 } network_shutdown_payload_t;
 
+/* NETWORK_APPLY_RATES payload: sparse rate/burst overrides in rpc_type_e
+   order (config.h CONFIG_RATE_TYPE_COUNT). Values <= 0 keep the compiled
+   default for that type. Allocated by the CALLER with get_clear_memory;
+   payload_destroy must be free — the actor run loop frees it after dispatch
+   (dispatch only reads it and never takes ownership). The single-writer
+   actor applies them via rate_limit_table_set_configs on its own thread. */
+typedef struct {
+  float rates[CONFIG_RATE_TYPE_COUNT];
+  float bursts[CONFIG_RATE_TYPE_COUNT];
+} network_apply_rates_payload_t;
+
+_Static_assert(CONFIG_RATE_TYPE_COUNT == RPC_TYPE_COUNT,
+               "config rate arrays must stay indexed by rpc_type_e");
+
 network_t* network_create(authority_t* authority, block_cache_t* block_cache,
                           timer_actor_t* timer, scheduler_pool_t* pool,
                           const config_t* config);
 void network_destroy(network_t* network);
 void network_dispatch(void* state, message_t* msg);
+
+/* Queue a live rate-limit update to the network actor (no restart needed).
+   Safe to call from any thread; the actor owns the table. Rates/bursts <= 0
+   keep the compiled defaults for those types (config.h CONFIG_RATE_TYPE_COUNT
+   ordering). Returns 0 on success, -1 when the network or its actor is not
+   available. */
+int network_apply_rate_configs(network_t* network,
+                               const float rates[CONFIG_RATE_TYPE_COUNT],
+                               const float bursts[CONFIG_RATE_TYPE_COUNT]);
 
 /* Mark the peer state dirty and arm a debounced NETWORK_PEER_STATE_SAVE on
    the network actor's timer. Called after Hebbian decay (or any other

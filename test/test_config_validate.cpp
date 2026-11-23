@@ -200,3 +200,22 @@ TEST(ConfigValidate, BearerOverHttpsAccepted) {
   free(config.https_cert_path);
   free(config.https_key_path);
 }
+
+TEST(TestConfigValidate, RejectsNegativeRateLimitValue) {
+  config_t config = config_default();
+  config.rate_limit_rates[0] = -1.0f;
+  EXPECT_NE(config_validate(&config), 0);
+}
+
+TEST(TestConfigValidate, RejectsNegativeRateLimitBurst) {
+  config_t config = config_default();
+  config.rate_limit_bursts[4] = -0.5f;
+  EXPECT_NE(config_validate(&config), 0);
+}
+
+TEST(TestConfigValidate, ZeroRateLimitValuesPass) {
+  config_t config = config_default();
+  config.rate_limit_rates[0] = 0.0f;   // 0 = compiled default
+  config.rate_limit_bursts[0] = 0.0f;
+  EXPECT_EQ(config_validate(&config), 0);
+}

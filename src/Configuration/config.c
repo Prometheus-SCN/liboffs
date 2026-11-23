@@ -51,6 +51,10 @@ config_t config_default() {
   config.respiration_tau_max_ms = 3600000;
   config.relay_max_retries = 5;
   config.relay_retry_delay_ms = 500;
+  for (int rate_index = 0; rate_index < CONFIG_RATE_TYPE_COUNT; rate_index++) {
+    config.rate_limit_rates[rate_index] = 0.0f;
+    config.rate_limit_bursts[rate_index] = 0.0f;
+  }
   config.ephemeral_registry_size = 1024;
   config.ephemeral_registry_hash_count = 4;
   config.ephemeral_registry_omega = 0.85f;
@@ -232,6 +236,20 @@ int config_validate(const config_t* config) {
   if (config->relay_retry_delay_ms == 0) {
     log_error("config_validate: relay_retry_delay_ms must be > 0");
     valid = false;
+  }
+
+  for (int rate_index = 0; rate_index < CONFIG_RATE_TYPE_COUNT; rate_index++) {
+    /* 0 keeps the compiled default for the type; anything below is invalid. */
+    if (config->rate_limit_rates[rate_index] < 0.0f) {
+      log_error("config_validate: rate_limit_rates[%d] (%f) must be >= 0 (0 = default)",
+                rate_index, config->rate_limit_rates[rate_index]);
+      valid = false;
+    }
+    if (config->rate_limit_bursts[rate_index] < 0.0f) {
+      log_error("config_validate: rate_limit_bursts[%d] (%f) must be >= 0 (0 = default)",
+                rate_index, config->rate_limit_bursts[rate_index]);
+      valid = false;
+    }
   }
 
   /* HTTPS requires cert and key paths */

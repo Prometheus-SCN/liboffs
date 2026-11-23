@@ -241,3 +241,66 @@ TEST(ConfigJson, ConfigToJsonEmitsCacheDir) {
   /* Stack literal, value-config: nothing heap-allocated to release and
      config_free() must not be called (see ConfigToJsonSerializesAllFieldGroups). */
 }
+
+TEST(ConfigJson, RateLimitFieldsAreKnownNumbers) {
+  EXPECT_EQ(CONFIG_FIELD_NUMBER, config_field_type("rate_find_block"));
+  EXPECT_EQ(CONFIG_FIELD_NUMBER, config_field_type("rate_find_block_burst"));
+  EXPECT_EQ(CONFIG_FIELD_NUMBER, config_field_type("rate_store_block"));
+  EXPECT_EQ(CONFIG_FIELD_NUMBER, config_field_type("rate_store_block_burst"));
+  EXPECT_EQ(CONFIG_FIELD_NUMBER, config_field_type("rate_seeking_blocks"));
+  EXPECT_EQ(CONFIG_FIELD_NUMBER, config_field_type("rate_seeking_blocks_burst"));
+  EXPECT_EQ(CONFIG_FIELD_NUMBER, config_field_type("rate_ping_capacity"));
+  EXPECT_EQ(CONFIG_FIELD_NUMBER, config_field_type("rate_ping_capacity_burst"));
+  EXPECT_EQ(CONFIG_FIELD_NUMBER, config_field_type("rate_ping"));
+  EXPECT_EQ(CONFIG_FIELD_NUMBER, config_field_type("rate_ping_burst"));
+  EXPECT_TRUE(config_is_known_field("rate_find_block"));
+  EXPECT_TRUE(config_is_known_field("rate_ping_burst"));
+}
+
+TEST(ConfigJson, RateLimitFieldsSerializeWhenSet) {
+  config_t config = config_default();
+  config.rate_limit_rates[0] = 100.0f;
+  config.rate_limit_bursts[0] = 400.0f;
+  cJSON* json = config_to_json(&config);
+  ASSERT_NE(json, nullptr);
+  cJSON* rate = cJSON_GetObjectItem(json, "rate_find_block");
+  ASSERT_NE(rate, nullptr);
+  EXPECT_TRUE(cJSON_IsNumber(rate));
+  EXPECT_DOUBLE_EQ(100.0, rate->valuedouble);
+  cJSON* burst = cJSON_GetObjectItem(json, "rate_find_block_burst");
+  ASSERT_NE(burst, nullptr);
+  EXPECT_DOUBLE_EQ(400.0, burst->valuedouble);
+  cJSON_Delete(json);
+}
+
+TEST(ConfigJson, RateLimitFieldsOmittedWhenZero) {
+  config_t config = config_default();
+  cJSON* json = config_to_json(&config);
+  ASSERT_NE(json, nullptr);
+  EXPECT_EQ(nullptr, cJSON_GetObjectItem(json, "rate_find_block"));
+  EXPECT_EQ(nullptr, cJSON_GetObjectItem(json, "rate_ping_burst"));
+  cJSON_Delete(json);
+}
+
+TEST(ConfigJson, RateLimitPendingLoadAppliesValues) {
+  /* config_pending_load is the only JSON→config_t parse entry point, so
+     stage a pending file carrying rate fields the same way the caller
+     would and assert the arrays pick them up. */
+  const char* pending_json =
+    "{\"rate_find_block\": 100, \"rate_find_block_burst\": 400}";
+  char dir[] = "/tmp/ offs rate limit test XXXX";
+  /* mkdtemp needs the XXXX pattern; reuse the pending helper path shape */
+  fs::path base = fs::temp_directory_path() /
+    fs::path("offs-rl-config-test");
+  fs::create_directories(base);
+  fs::path pending_path = base / "pending_config.json";
+  { std::ofstream out(pending_path); out << pending_json; }
+  config_t* config = config_pending_load(base.string().c_str());
+  ASSERT_NE(config, nullptr);
+  EXPECT_FLOAT_EQ(100.0f, config->rate_limit_rates[0]);
+  EXPECT_FLOAT_EQ(400.0f, config->rate_limit_bursts[0]);
+  EXPECT_FLOAT_EQ(0.0f, config->rate_limit_rates[1]);
+  config_free(config);
+  fs::remove(pending_path);
+  fs::remove(base);
+}

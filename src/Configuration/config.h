@@ -7,6 +7,15 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+/* Peer rate-limit arrays are indexed by the Network layer's rpc_type_e
+   (src/Network/rate_limit.h): 0 find-block, 1 store-block, 2 seeking-blocks,
+   3 ping-capacity, 4 ping. Kept as plain floats so the Configuration module
+   does not depend on the Network module. A value of 0 (or absent from the
+   config JSON) keeps the compiled default for that type — see
+   rate_limit_configs_merge in src/Network/rate_limit.c. */
+#define CONFIG_RATE_TYPE_COUNT 5
+
 typedef struct {
   size_t index_bucket_size;
   size_t index_wait;
@@ -43,6 +52,12 @@ typedef struct {
   uint32_t respiration_tau_max_ms;
   size_t relay_max_retries;
   uint32_t relay_retry_delay_ms;
+
+  /* Peer rate limits, hot-changeable via the config surface (staged fields
+     whose names are all rate_* apply live through the network actor; other
+     staged fields still require restart). 0 = compiled default. */
+  float rate_limit_rates[CONFIG_RATE_TYPE_COUNT];   // sustained tokens/s (maps to max_rate)
+  float rate_limit_bursts[CONFIG_RATE_TYPE_COUNT];  // max accumulated tokens (maps to burst_size)
 
   /* Ephemeral registry — persistent elastic bloom filter of ephemeral
      representation descriptor hashes (startup-only, not a mutable field). */

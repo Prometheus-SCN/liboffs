@@ -3,6 +3,7 @@
 //
 
 #include "node.h"
+#include "../Configuration/config_json.h"
 #include "../Platform/platform_time.h"
 #include <time.h>
 #include "../BlockCache/block_cache.h"
@@ -319,4 +320,39 @@ void offs_node_restart(offs_node_t* node, const char* data_dir) {
   config_pending_mark_applied(data_dir);
 
   log_info("offs_node_restart: restart complete");
+}
+/* Live rate-limit application. The staged-config handlers call this after a
+   successful stage when every staged field is a rate field; values land on
+   the network actor without a restart (network_apply_rate_configs). The
+   pending-config file keeps the same values so a restart reproduces them
+   through config_pending_load + network_create. */
+int offs_node_apply_rate_configs_from_json(offs_node_t* node,
+                                           const void* json_object) {
+  if (node == NULL || json_object == NULL) return -1;
+  const cJSON* object = (const cJSON*)json_object;
+  if (!cJSON_IsObject(object)) return -1;
+
+  float rates[CONFIG_RATE_TYPE_COUNT] = {0};
+  float bursts[CONFIG_RATE_TYPE_COUNT] = {0};
+  int applied_count = 0;
+
+  for (const cJSON* item = object->child; item != NULL; item = item->next) {
+    bool is_burst = false;
+    int rate_index = config_rate_field_index(item->string, &is_burst);
+    if (rate_index < 0) continue;
+    if (!cJSON_IsNumber(item) || item->valuedouble < 0.0) {
+      return -1;
+    }
+    if (is_burst) {
+      bursts[rate_index] = (float)item->valuedouble;
+    } else {
+      rates[rate_index] = (float)item->valuedouble;
+    }
+    applied_count++;
+  }
+
+  if (applied_count == 0) return 0;
+  if (node->network == NULL) return -1;
+  if (network_apply_rate_configs(node->network, rates, bursts) != 0) return -1;
+  return applied_count;
 }

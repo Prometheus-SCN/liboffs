@@ -28,6 +28,7 @@ void rate_limit_table_init(rate_limit_table_t* table, size_t capacity) {
   table->max_count = 0;
   table->peer_count = 0;
   table->reference_peer_count = REFERENCE_PEER_COUNT;
+  memcpy(table->configs, RATE_LIMIT_DEFAULTS, sizeof(table->configs));
 }
 
 void rate_limit_table_set_max_count(rate_limit_table_t* table, size_t max_count) {
@@ -106,10 +107,10 @@ peer_rate_limits_t* rate_limit_table_get(rate_limit_table_t* table, const node_i
 
   // Initialize all token buckets with effective burst size (scaled for small networks)
   for (int type = 0; type < RPC_TYPE_COUNT; type++) {
-    float effective_burst = RATE_LIMIT_DEFAULTS[type].burst_size;
+    float effective_burst = table->configs[type].burst_size;
     if (table->peer_count > 0 && table->peer_count < table->reference_peer_count) {
       float multiplier = ((float)table->reference_peer_count / (float)table->peer_count) * LOW_NETWORK_MULTIPLIER;
-      effective_burst = RATE_LIMIT_DEFAULTS[type].burst_size * multiplier;
+      effective_burst = table->configs[type].burst_size * multiplier;
     }
     entry->buckets[type].tokens = effective_burst;
     entry->buckets[type].last_refill = 0;
@@ -168,7 +169,7 @@ bool rate_limit_check(rate_limit_table_t* table, const node_id_t* peer_id,
   if (entry == NULL) return false;
 
   token_bucket_t* bucket = &entry->buckets[type];
-  const token_bucket_config_t* config = &RATE_LIMIT_DEFAULTS[type];
+  const token_bucket_config_t* config = &table->configs[type];
 
   // Compute effective config with inverse scaling + low-network multiplier
   token_bucket_config_t effective_config = *config;
@@ -203,7 +204,7 @@ void rate_limit_charge(rate_limit_table_t* table, const node_id_t* peer_id,
   if (entry == NULL) return;
 
   token_bucket_t* bucket = &entry->buckets[type];
-  const token_bucket_config_t* config = &RATE_LIMIT_DEFAULTS[type];
+  const token_bucket_config_t* config = &table->configs[type];
 
   // Compute effective config with inverse scaling + low-network multiplier
   // (mirrors rate_limit_check so the charge applies to the same bucket state).
@@ -232,7 +233,7 @@ uint32_t rate_limit_retry_after(rate_limit_table_t* table, const node_id_t* peer
   if (entry == NULL) return 0;
 
   token_bucket_t* bucket = &entry->buckets[type];
-  const token_bucket_config_t* config = &RATE_LIMIT_DEFAULTS[type];
+  const token_bucket_config_t* config = &table->configs[type];
 
   // How long until we have enough tokens?
   float deficit = config->cost - bucket->tokens;
@@ -266,10 +267,36 @@ void rate_limit_table_set_peer_count(rate_limit_table_t* table, size_t peer_coun
 
 float rate_limit_effective_rate(const rate_limit_table_t* table, rpc_type_e type) {
   if (table == NULL || type < 0 || type >= RPC_TYPE_COUNT) return 0.0f;
-  float base_rate = RATE_LIMIT_DEFAULTS[type].max_rate;
+  float base_rate = table->configs[type].max_rate;
   if (table->peer_count == 0 || table->peer_count >= table->reference_peer_count) {
     return base_rate;
   }
   float multiplier = ((float)table->reference_peer_count / (float)table->peer_count) * LOW_NETWORK_MULTIPLIER;
   return base_rate * multiplier;
+}
+// --- Config-driven live updates ---
+
+void rate_limit_table_set_configs(rate_limit_table_t* table,
+                                  const token_bucket_config_t configs[RPC_TYPE_COUNT]) {
+  if (table == NULL || configs == NULL) return;
+  for (int type = 0; type < RPC_TYPE_COUNT; type++) {
+    if (configs[type].max_rate < 0.0f || configs[type].burst_size < 0.0f) {
+      continue;  // invalid entry keeps the current value for that type
+    }
+    table->configs[type] = configs[type];
+  }
+}
+
+void rate_limit_configs_merge(const float rates[RPC_TYPE_COUNT],
+                              const float bursts[RPC_TYPE_COUNT],
+                              token_bucket_config_t out[RPC_TYPE_COUNT]) {
+  for (int type = 0; type < RPC_TYPE_COUNT; type++) {
+    out[type] = RATE_LIMIT_DEFAULTS[type];
+    if (rates != NULL && rates[type] > 0.0f) {
+      out[type].max_rate = rates[type];
+    }
+    if (bursts != NULL && bursts[type] > 0.0f) {
+      out[type].burst_size = bursts[type];
+    }
+  }
 }

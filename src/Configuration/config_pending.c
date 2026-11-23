@@ -1,4 +1,5 @@
 #include "config_pending.h"
+#include "config_json.h"
 #include "../Util/allocator.h"
 #include "../Util/log.h"
 #include <cJSON.h>
@@ -167,6 +168,18 @@ config_t* config_pending_load(const char* data_dir) {
       config->tcp_tls_key_path = strdup(item->valuestring);
     else if (strcmp(item->string, "cache_dir") == 0 && cJSON_IsString(item))
       config->cache_dir = strdup(item->valuestring);
+    /* rate limit fields */
+    else {
+      bool is_burst = false;
+      int rate_index = config_rate_field_index(item->string, &is_burst);
+      if (rate_index >= 0 && cJSON_IsNumber(item)) {
+        if (is_burst) {
+          config->rate_limit_bursts[rate_index] = (float)item->valuedouble;
+        } else {
+          config->rate_limit_rates[rate_index] = (float)item->valuedouble;
+        }
+      }
+    }
 
     item = item->next;
   }

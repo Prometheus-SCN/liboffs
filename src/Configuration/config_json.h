@@ -32,6 +32,11 @@ bool config_is_known_field(const char* name);
    unknown fields — callers should check config_is_known_field first. */
 config_field_type_t config_field_type(const char* name);
 
+/* If name is a peer rate-limit field ("rate_<type>" or "rate_<type>_burst" —
+   see config.h CONFIG_RATE_TYPE_COUNT ordering), set *is_burst accordingly
+   and return the config-array index. Returns -1 for any other name. */
+int config_rate_field_index(const char* name, bool* is_burst);
+
 /* Serialize the full config_t to a cJSON object (caller must cJSON_Delete). */
 cJSON* config_to_json(const config_t* config);
 

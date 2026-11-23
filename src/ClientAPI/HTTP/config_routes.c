@@ -119,6 +119,7 @@ static void _config_put_handler(http_request_t* request, http_response_t* respon
   cJSON* rejected = cJSON_CreateArray();
   cJSON* staged = cJSON_CreateArray();
   bool has_valid = false;
+  bool has_non_rate_field = false;
 
   cJSON* item = incoming->child;
   while (item != NULL) {
@@ -160,19 +161,41 @@ static void _config_put_handler(http_request_t* request, http_response_t* respon
       continue;
     }
 
-    cJSON_AddItemToArray(staged,
-      cJSON_CreateString(item->string));
+    /* Negative rate values cannot satisfy config_validate — reject upfront
+       so a restart never inherits a config that fails validation. */
+    bool is_burst = false;
+    bool is_rate_field = config_rate_field_index(item->string, &is_burst) >= 0;
+    if (is_rate_field && item->valuedouble < 0.0) {
+      cJSON* entry = cJSON_CreateObject();
+      cJSON_AddStringToObject(entry, "field", item->string);
+      cJSON_AddStringToObject(entry, "reason", "rate fields must be >= 0");
+      cJSON_AddItemToArray(rejected, entry);
+      item = item->next;
+      continue;
+    }
+
+    if (!is_rate_field) {
+      has_non_rate_field = true;
+    }
+    cJSON_AddItemToArray(staged, cJSON_CreateString(item->string));
     has_valid = true;
     item = item->next;
   }
 
   /* Save to pending config if any valid fields */
   bool restart_required = false;
+  int applied_live = 0;
   if (has_valid) {
     if (config_pending_save(ctx->data_dir,
                             (const char*)request->body->data,
                             request->body->size) == 0) {
-      restart_required = true;
+      /* Rate-limit fields hot-apply through the network actor; a staged set
+         containing any other field still restarts first (only-rate staged
+         sets apply live while remaining pending for restart consistency). */
+      if (!has_non_rate_field) {
+        applied_live = offs_node_apply_rate_configs_from_json(ctx->node, incoming);
+      }
+      restart_required = applied_live > 0 ? false : true;
     } else {
       /* Save failed — move all staged to rejected */
       cJSON* entry = cJSON_CreateObject();
@@ -192,6 +215,10 @@ static void _config_put_handler(http_request_t* request, http_response_t* respon
   cJSON_AddItemToObject(result, "staged", staged);
   cJSON_AddItemToObject(result, "rejected", rejected);
   cJSON_AddBoolToObject(result, "restart_required", restart_required);
+  if (applied_live > 0) {
+    cJSON_AddStringToObject(result, "applied",
+                            "rate limits applied live; staged for restart consistency");
+  }
 
   char* json_str = cJSON_Print(result);
   cJSON_Delete(result);

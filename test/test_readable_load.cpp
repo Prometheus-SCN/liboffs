@@ -922,3 +922,173 @@ TEST(ReadableOffLoadModeLoad, SharedMissingHashAcrossSkipDoesNotHang) {
   timer_actor_destroy(timer);
   scheduler_pool_destroy(pool);
 }
+
+/* ---- helper: late cache-hit message (duplicate-delivery case) ---- */
+
+static void late_cache_get_result_destroy(void* ptr) {
+  cache_get_result_payload_t* payload = (cache_get_result_payload_t*)ptr;
+  if (payload->hash != NULL) {
+    DESTROY(payload->hash, buffer);
+  }
+  if (payload->block != NULL) {
+    block_destroy(payload->block);
+  }
+  free(payload);
+}
+
+/* Build a direct find-result message for `hash` carrying a BLOCK_SIZE block
+   filled with `fill_byte`; the caller releases the returned data buffer (the
+   block only carries a reference on it). */
+static void send_find_result(readable_off_stream_t* stream, buffer_t* hash,
+                             uint8_t fill_byte, buffer_t** out_data) {
+  buffer_t* data = buffer_create(BLOCK_SIZE);
+  memset(data->data, fill_byte, BLOCK_SIZE);
+  block_t* block = block_create_existing_data_hash(data, hash);
+  *out_data = data;
+  network_find_block_result_payload_t* result =
+      (network_find_block_result_payload_t*)get_clear_memory(
+          sizeof(network_find_block_result_payload_t));
+  result->hash = REFERENCE(hash, buffer_t);
+  result->found = 1;
+  result->block = block;
+  message_t msg;
+  msg.type = NETWORK_FIND_BLOCK_RESULT;
+  msg.payload = result;
+  msg.payload_destroy = late_network_result_destroy;
+  actor_send(&stream->stream.actor, &msg);
+}
+
+/* Build a late cache-hit message for `hash` (a duplicate of data the stream
+   already received via a direct result, racing the outstanding get). */
+static void send_cache_hit(readable_off_stream_t* stream, buffer_t* hash,
+                           uint8_t fill_byte, buffer_t** out_data) {
+  buffer_t* data = buffer_create(BLOCK_SIZE);
+  memset(data->data, fill_byte, BLOCK_SIZE);
+  block_t* block = block_create_existing_data_hash(data, hash);
+  *out_data = data;
+  cache_get_result_payload_t* hit =
+      (cache_get_result_payload_t*)get_clear_memory(sizeof(cache_get_result_payload_t));
+  hit->hash = REFERENCE(hash, buffer_t);
+  hit->block = block;
+  message_t msg;
+  msg.type = CACHE_GET_RESULT;
+  msg.payload = hit;
+  msg.payload_destroy = late_cache_get_result_destroy;
+  actor_send(&stream->stream.actor, &msg);
+}
+
+/* ---- duplicate delivery of one block must be counted once ----
+ *
+ * Regression for the tuple-reorder cascade: each fanout holder answers the
+ * same find id, and the loser's late copy lands in the cache and completes
+ * the outstanding block_cache_get as a late hit after the direct result
+ * already XORed the same hash. The pre-fix stream XORed and counted the
+ * duplicate too: the tuple decoded early with wrong data and the overflow
+ * block polluted the next tuple's accumulator. Post-fix, a result whose hash
+ * is no longer an unanswered fetch of the live tuple (and is not a stale
+ * fetch) is dropped; a result that races ahead of the fetch start is parked
+ * with its block until the fetch start folds it in. */
+TEST(ReadableOffLoadModeLoad, DuplicateDeliveryDropped) {
+  scheduler_pool_t* pool = scheduler_pool_create(2);
+  scheduler_pool_start(pool);
+  timer_actor_t* timer = timer_actor_create(pool);
+
+  char* cache_path = (char*)"test_readable_load_bc_dupdelivery";
+  rm_rf(cache_path);
+  mkdir_p(cache_path);
+  block_cache_t* block_cache = block_cache_create(
+      config_t{.index_bucket_size = 10, .index_wait = 0, .index_max_wait = 0,
+               .section_size = 128000, .section_wait = 0, .section_max_wait = 0,
+               .cache_size = 50, .max_tuple_size = 30, .lru_size = 50},
+      cache_path, standard, timer, pool, NULL, 0);
+  tuple_cache_t* tuple_cache = tuple_cache_create(100, pool);
+
+  /* No seeded blocks: both tuples resolve entirely through injected
+     NETWORK_FIND_BLOCK_RESULT / CACHE_GET_RESULT messages. */
+  network_t* network = (network_t*)get_clear_memory(sizeof(network_t));
+  actor_init(&network->actor, network, load_test_network_noop_dispatch, pool);
+  network->wanted_list = wanted_list_create();
+
+  tuple_t* tuple_a = make_missing_tuple(0xA0);
+  tuple_t* tuple_b = make_missing_tuple(0xB0);
+
+  buffer_t* file_hash = make_file_hash();
+  ori_t* ori = ori_create(2 * BLOCK_SIZE);
+  ori->block_type = standard;
+  ori->file_offset = 0;
+  ori->file_hash = REFERENCE(file_hash, buffer_t);
+
+  readable_off_stream_t* stream =
+      readable_off_stream_create_ex(pool, block_cache, tuple_cache, ori, 0, network, 1);
+  ASSERT_NE(stream, nullptr);
+
+  std::vector<uint8_t> data_events;
+  stream_subscribe((stream_t*)stream, data_event, &data_events, on_data_record, NULL);
+
+  LoadRecorder load_recorder(2);
+  stream_subscribe((stream_t*)stream, load_tuple_event, &load_recorder, on_load_record, NULL);
+  stream_subscribe((stream_t*)stream, close_event, &load_recorder, on_close_note_loads, NULL);
+
+  std::promise<void> close_promise;
+  stream_subscribe((stream_t*)stream, close_event, &close_promise, on_close_set_promise, NULL);
+
+  readable_off_stream_write(stream, tuple_a);
+  readable_off_stream_write(stream, tuple_b);
+  /* Let the six block misses reach the stub network. */
+  scheduler_pool_wait_for_idle(pool);
+
+  uint8_t a_bytes[TUPLE_SIZE] = {0x11, 0x24, 0x36};
+  buffer_t* a_data0; buffer_t* a_data1; buffer_t* a_hit; buffer_t* a_data2;
+  send_find_result(stream, tuple_get(tuple_a, 0), a_bytes[0], &a_data0);
+  send_find_result(stream, tuple_get(tuple_a, 1), a_bytes[1], &a_data1);
+  send_cache_hit(stream, tuple_get(tuple_a, 0), a_bytes[0], &a_hit);
+  send_find_result(stream, tuple_get(tuple_a, 2), a_bytes[2], &a_data2);
+
+  uint8_t b_bytes[TUPLE_SIZE] = {0x41, 0x52, 0x63};
+  buffer_t* b_data0; buffer_t* b_data1; buffer_t* b_data2;
+  send_find_result(stream, tuple_get(tuple_b, 0), b_bytes[0], &b_data0);
+  send_find_result(stream, tuple_get(tuple_b, 1), b_bytes[1], &b_data1);
+  send_find_result(stream, tuple_get(tuple_b, 2), b_bytes[2], &b_data2);
+
+  auto close_future = close_promise.get_future();
+  EXPECT_EQ(close_future.wait_for(std::chrono::seconds(5)), std::future_status::ready)
+      << "stream must resolve both tuples";
+  auto load_future = load_recorder.done_promise.get_future();
+  EXPECT_EQ(load_future.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+
+  scheduler_pool_wait_for_idle(pool);
+
+  /* Both tuples render their true XOR, undisturbed by the duplicate. */
+  ASSERT_EQ(data_events.size(), 2u);
+  EXPECT_EQ(data_events[0], a_bytes[0] ^ a_bytes[1] ^ a_bytes[2]);
+  EXPECT_EQ(data_events[1], b_bytes[0] ^ b_bytes[1] ^ b_bytes[2]);
+  /* Both tuples loaded, none skipped. */
+  ASSERT_EQ(load_recorder.entries.size(), 2u);
+  EXPECT_EQ(load_recorder.entries[0].loaded, 1u);
+  EXPECT_EQ(load_recorder.entries[0].skipped, 0u);
+  EXPECT_EQ(load_recorder.entries[1].loaded, 2u);
+  EXPECT_EQ(load_recorder.entries[1].skipped, 0u);
+  EXPECT_EQ(stream->stream.is_deactivated, 0);
+
+  scheduler_pool_stop(pool);
+
+  readable_off_stream_destroy(stream);
+  tuple_cache_destroy(tuple_cache);
+  block_cache_destroy(block_cache);
+  wanted_list_destroy(network->wanted_list);
+  actor_destroy(&network->actor);
+  free(network);
+  DESTROY(a_data0, buffer);
+  DESTROY(a_data1, buffer);
+  DESTROY(a_hit, buffer);
+  DESTROY(a_data2, buffer);
+  DESTROY(b_data0, buffer);
+  DESTROY(b_data1, buffer);
+  DESTROY(b_data2, buffer);
+  DESTROY(tuple_a, tuple);
+  DESTROY(tuple_b, tuple);
+  DESTROY(file_hash, buffer);
+  ori_destroy(ori);
+  timer_actor_destroy(timer);
+  scheduler_pool_destroy(pool);
+}

@@ -6,6 +6,7 @@
 #include "../peer_verify.h"
 #include "../../Scheduler/scheduler.h"
 #include "../../Util/log.h"
+#include "../../Platform/platform_process.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -32,6 +33,10 @@ static BOOL WINAPI _relay_ctrl_handler(DWORD type) {
 #endif
 
 int main(int argc, char* argv[]) {
+  /* Same fd-headroom rationale as the offsd daemon startup. */
+  if (platform_raise_nofile_limit() != 0) {
+    fprintf(stderr, "Warning: could not raise RLIMIT_NOFILE to the hard limit\n");
+  }
   uint16_t port = 14000;
   const char* host = NULL;
   const char* cert_path = NULL;

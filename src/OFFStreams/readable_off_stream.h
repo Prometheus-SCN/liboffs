@@ -24,6 +24,10 @@ typedef struct pending_block_fetch_t {
   buffer_t* hash;
   size_t index;
   struct pending_block_fetch_t* next;
+  /* Non-NULL only in presatisfied entries (results that raced ahead of the
+     fetch start): the delivered block, parked until _start_block_fetches
+     XORs it in and destroys it. */
+  block_t* carried_block;
 } pending_block_fetch_t;
 
 /* Queued tuple waiting to be processed */
@@ -74,6 +78,12 @@ typedef struct {
    * readable_off_stream.c): late results matching these are dropped so they
    * cannot corrupt the live tuple's XOR accumulator. */
   pending_block_fetch_t* stale_fetches;
+  /* Results for the live tuple that arrive BEFORE its fetches are issued (the
+     tuple is being readied: pending_tuple set, but block_cache_get/find are
+     only sent from the tuple-cache callback). Each is parked here keyed by
+     hash; _start_block_fetches skips re-issuing satisfied hashes and counts
+     them in. */
+  pending_block_fetch_t* presatisfied_fetches;
   /* Queue of tuples waiting to be processed */
   pending_tuple_t* tuple_queue;
 } readable_off_stream_t;

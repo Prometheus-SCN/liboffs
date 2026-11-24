@@ -122,6 +122,22 @@ static void _clear_fetch_list(pending_block_fetch_t* head) {
 }
 
 /* Release every stale fetch hash parked by skipped tuples. */
+/* Destroy every presatisfied entry, releasing the carried block (racing
+   results parked before the fetch start) and the hash reference. */
+static void _clear_presatisfied(readable_off_stream_t* stream) {
+  pending_block_fetch_t* fetch = stream->presatisfied_fetches;
+  while (fetch != NULL) {
+    pending_block_fetch_t* next = fetch->next;
+    if (fetch->carried_block != NULL) {
+      DESTROY(fetch->carried_block, block);
+    }
+    DESTROY(fetch->hash, buffer);
+    free(fetch);
+    fetch = next;
+  }
+  stream->presatisfied_fetches = NULL;
+}
+
 static void _clear_stale_fetches(readable_off_stream_t* stream) {
   _clear_fetch_list(stream->stale_fetches);
   stream->stale_fetches = NULL;
@@ -135,9 +151,9 @@ static void _clear_stale_fetches(readable_off_stream_t* stream) {
  * A node's hash buffer is a private reference on the tuple's hash (taken by
  * _start_block_fetches), so destroying the node's reference never frees the
  * hash the tuple still owns. */
-static void _prune_answered_fetch(readable_off_stream_t* stream, buffer_t* hash) {
+static uint8_t _prune_answered_fetch(readable_off_stream_t* stream, buffer_t* hash) {
   if (hash == NULL) {
-    return;
+    return 0;
   }
   pending_block_fetch_t** current = &stream->pending_fetches;
   while (*current != NULL) {
@@ -146,10 +162,11 @@ static void _prune_answered_fetch(readable_off_stream_t* stream, buffer_t* hash)
       *current = fetch_node->next;
       DESTROY(fetch_node->hash, buffer);
       free(fetch_node);
-      return;
+      return 1;
     }
     current = &fetch_node->next;
   }
+  return 0;
 }
 
 /* If the result hash belongs to a tuple that was already skipped, consume the
@@ -256,21 +273,98 @@ static void _finish_decode_and_render(readable_off_stream_t* stream) {
   _drain_tuple_queue(stream);
 }
 
+/* If the result hash belongs to the tuple currently being readied (pending
+   tuple set, fetches not yet started), move it to the presatisfied list and
+   return 1. The tuple's own hash list defines the fetch set before any get or
+   find is issued, so a result arriving in that window is a legitimate answer
+   that must be parked (and XORed) until _start_block_fetches picks it up. */
+static uint8_t _tuple_contains_hash(const tuple_t* tuple, const buffer_t* hash) {
+  if (tuple == NULL || hash == NULL) return 0;
+  size_t count = tuple_size((tuple_t*)tuple);
+  for (size_t index = 0; index < count; index++) {
+    buffer_t* candidate = tuple_get((tuple_t*)tuple, index);
+    if (candidate != NULL && buffer_compare(candidate, (buffer_t*)hash) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static void _park_presatisfied(readable_off_stream_t* stream, buffer_t* hash,
+                               block_t* block) {
+  pending_block_fetch_t* fetch = get_clear_memory(sizeof(pending_block_fetch_t));
+  fetch->hash = (buffer_t*)refcounter_reference((refcounter_t*)hash);
+  fetch->index = 0;
+  fetch->carried_block = block;
+  fetch->next = stream->presatisfied_fetches;
+  stream->presatisfied_fetches = fetch;
+}
+
+/* Issue (or re-issue) an outstanding fetch node for a single hash of the live
+   tuple outside the normal start path — used when a network result with
+   block==NULL asks the stream to re-fetch from the now-populated cache while
+   the tuple's fetch bookkeeping has already been pruned. */
+static void _issue_fetch_for_hash(readable_off_stream_t* stream, buffer_t* hash) {
+  pending_block_fetch_t* fetch = get_clear_memory(sizeof(pending_block_fetch_t));
+  fetch->hash = (buffer_t*)refcounter_reference((refcounter_t*)hash);
+  fetch->index = 0;
+  fetch->next = stream->pending_fetches;
+  stream->pending_fetches = fetch;
+  block_cache_get(stream->bc, hash, &stream->stream.actor);
+}
+
 static void _start_block_fetches(readable_off_stream_t* stream) {
   size_t count = tuple_size(stream->pending_tuple);
   stream->blocks_expected = count;
-  stream->blocks_received = 0;
-  stream->xor_accumulator = NULL;
   stream->pending_fetches = NULL;
 
+  /* Results that raced ahead of this lookup are already parked (hash list
+     + XOR accumulator); count them in and only fetch what is still missing. */
+  size_t presatisfied_count = 0;
   for (size_t i = 0; i < count; i++) {
     buffer_t* hash = tuple_get(stream->pending_tuple, i);
-    pending_block_fetch_t* fetch = get_clear_memory(sizeof(pending_block_fetch_t));
-    fetch->hash = (buffer_t*)refcounter_reference((refcounter_t*)hash);
-    fetch->index = i;
-    fetch->next = stream->pending_fetches;
-    stream->pending_fetches = fetch;
-    block_cache_get(stream->bc, hash, &stream->stream.actor);
+    pending_block_fetch_t* raced = NULL;
+    pending_block_fetch_t** parked = &stream->presatisfied_fetches;
+    while (*parked != NULL) {
+      pending_block_fetch_t* node = *parked;
+      if (buffer_compare(node->hash, hash) == 0) {
+        *parked = node->next;
+        raced = node;
+        break;
+      }
+      parked = &node->next;
+    }
+    if (raced != NULL) {
+      DESTROY(raced->hash, buffer);
+      if (raced->carried_block != NULL) {
+        /* Fold the raced block into the accumulator now: _render_origin_data
+           only receives completed XORs, so every contribution must land. */
+        if (stream->xor_accumulator == NULL) {
+          stream->xor_accumulator = buffer_copy(raced->carried_block->data);
+        } else {
+          buffer_t* xored = buffer_xor(stream->xor_accumulator, raced->carried_block->data);
+          DESTROY(stream->xor_accumulator, buffer);
+          stream->xor_accumulator = xored;
+        }
+        DESTROY(raced->carried_block, block);
+      }
+      free(raced);
+      presatisfied_count++;
+    } else {
+      pending_block_fetch_t* fetch = get_clear_memory(sizeof(pending_block_fetch_t));
+      fetch->hash = (buffer_t*)refcounter_reference((refcounter_t*)hash);
+      fetch->index = i;
+      fetch->next = stream->pending_fetches;
+      stream->pending_fetches = fetch;
+      block_cache_get(stream->bc, hash, &stream->stream.actor);
+    }
+  }
+  stream->blocks_received = presatisfied_count;
+  if (presatisfied_count == 0) {
+    stream->xor_accumulator = NULL;
+  }
+  if (stream->blocks_received >= stream->blocks_expected) {
+    _finish_decode_and_render(stream);
   }
 }
 
@@ -442,10 +536,40 @@ void readable_off_stream_dispatch(void* state, message_t* msg) {
         break;
       }
 
-      /* Accumulate block into XOR result. First prune the matching fetch from
-       * pending_fetches: this result has been answered, and it must not be
-       * parked in stale_fetches if the tuple is later skipped. */
-      _prune_answered_fetch(stream, result->hash);
+      /* Accumulate block into XOR result. The hash must prune an outstanding
+       * fetch of the live tuple: a hit for a hash that is not unanswered
+       * pending state is either a duplicate of an already-answered block
+       * (the direct network result XORed it, or the cache was refilled
+       * under the outstanding get) or a stray from an earlier tuple.
+       * Consuming it would XOR and count twice — decode early, wrong bytes,
+       * and pollution of the next tuple's accumulator. A miss (block NULL)
+       * is handled above; it does not prune, because a subsequent network
+       * result may still complete the same hash. A race ahead of the fetch
+       * start (the result beats the tuple-cache miss back) parks the hash
+       * and its block so _start_block_fetches folds it in and does not
+       * re-fetch it. */
+      if (!_prune_answered_fetch(stream, result->hash) && result->hash != NULL) {
+        if (stream->pending_tuple != NULL &&
+            _tuple_contains_hash(stream->pending_tuple, result->hash)) {
+          _park_presatisfied(stream, result->hash, result->block);
+        } else {
+          DESTROY(result->block, block);
+          result->block = NULL;
+          if (result->hash != NULL) {
+            DESTROY(result->hash, buffer);
+            result->hash = NULL;
+          }
+          break;
+        }
+        /* Ownership of the block moved to the parked entry: null the result
+           block, then drop the references. */
+        result->block = NULL;
+        if (result->hash != NULL) {
+          DESTROY(result->hash, buffer);
+          result->hash = NULL;
+        }
+        break;
+      }
       if (stream->xor_accumulator == NULL) {
         stream->xor_accumulator = buffer_copy(result->block->data);
       } else {
@@ -486,11 +610,41 @@ void readable_off_stream_dispatch(void* state, message_t* msg) {
       if (result->found) {
         if (result->block != NULL) {
           /* Direct-return: network provided the block. XOR-accumulate it
-           * directly instead of re-fetching from the cache. Prune the matching
-           * fetch from pending_fetches first — answered fetches must never be
-           * parked in stale_fetches by a later skip. */
-          _prune_answered_fetch(stream, result->hash);
-          if (stream->xor_accumulator == NULL) {
+           * directly instead of re-fetching from the cache. The hash MUST
+           * prune an outstanding fetch: the wanted-list notifies the
+           * requester exactly once per find, but each fanout holder answers
+           * the same find id and the loser's late reply still carries data —
+           * pruning first also absorbs the case where the outstanding
+           * block_cache_get completes as a late cache hit before this result
+           * (either way, only ONE copy may XOR and count). A result that
+           * answers nothing is a duplicate or a stray from an earlier tuple;
+           * consuming it would over-count the accumulator, decode the tuple
+           * with wrong data, and leak the block into a later tuple. */
+          if (!_prune_answered_fetch(stream, result->hash) && result->hash != NULL) {
+            if (stream->pending_tuple != NULL &&
+              _tuple_contains_hash(stream->pending_tuple, result->hash)) {
+            _park_presatisfied(stream, result->hash, result->block);
+          } else {
+            if (result->block != NULL) {
+              DESTROY(result->block, block);
+              result->block = NULL;
+            }
+            if (result->hash != NULL) {
+              DESTROY(result->hash, buffer);
+              result->hash = NULL;
+            }
+            break;
+          }
+          /* Ownership of the block moved to the parked entry: null the result
+             block, then drop the references. */
+          result->block = NULL;
+          if (result->hash != NULL) {
+            DESTROY(result->hash, buffer);
+            result->hash = NULL;
+          }
+          break;
+        }
+        if (stream->xor_accumulator == NULL) {
             stream->xor_accumulator = buffer_copy(result->block->data);
           } else {
             buffer_t* xored = buffer_xor(stream->xor_accumulator, result->block->data);
@@ -502,12 +656,26 @@ void readable_off_stream_dispatch(void* state, message_t* msg) {
             _finish_decode_and_render(stream);
           }
         } else {
-          /* Local path: block is in the cache. Re-fetch as before. */
+          /* Local path: block is in the cache. The found result just ANSWERED
+             the outstanding fetch (the miss preceded it), so re-fetch with a
+             fresh fetch node — its reply prunes normally and counts once. A
+             result that prunes nothing is a duplicate in flight; issuing a
+             second get for it would deliver a second reply that finds no
+             fetch node, so only re-fetch after a successful prune. */
           buffer_t* fetch_hash = result->hash;
-          if (fetch_hash != NULL) {
+          if (fetch_hash != NULL && _prune_answered_fetch(stream, fetch_hash)) {
+            /* Swap the pruned node back in: the re-fetch needs a fetch node
+               of its own so the coming CACHE_GET_RESULT prunes it. */
+            _issue_fetch_for_hash(stream, fetch_hash);
             block_cache_get(stream->bc, fetch_hash, &stream->stream.actor);
+            stream->state = OFF_STREAM_FETCHING_BLOCKS;
+          } else if (fetch_hash != NULL) {
+            /* Not outstanding (answered or presatisfied/stale) — park the
+               pruned-off state as-is: nothing else can consume this reply. */
+            stream->state = OFF_STREAM_FETCHING_BLOCKS;
+          } else {
+            stream->state = OFF_STREAM_FETCHING_BLOCKS;
           }
-          stream->state = OFF_STREAM_FETCHING_BLOCKS;
         }
       } else if (stream->load_mode) {
         /* Load mode: block never found on the network — skip the tuple and
@@ -574,6 +742,7 @@ static void _close_stream(readable_off_stream_t* stream) {
   }
   stream->pending_fetches = NULL;
   _clear_stale_fetches(stream);
+  _clear_presatisfied(stream);
   stream->closed = 1;
   stream_notify((stream_t*)stream, close_event, NULL, NULL);
   ATOMIC_STORE(&stream->stream.is_deactivated, 1);
@@ -653,6 +822,7 @@ void readable_off_stream_destroy(readable_off_stream_t* stream) {
     }
     stream->pending_fetches = NULL;
     _clear_stale_fetches(stream);
+    _clear_presatisfied(stream);
     /* Unregister this stream's wanted_list requesters BEFORE the struct (and
        its embedded actor) is freed, so a late NETWORK_FIND_BLOCK_RESULT can't
        actor_send into freed memory. See network_local_find_cancel_send. */

@@ -73,6 +73,8 @@ typedef struct {
   actor_t* target;
   uint32_t completion_type;
   timer_actor_t* timer_actor;  // back-reference for two-hop dispatch
+  uint8_t one_shot;            // set for interval_ms == 0 timers: the fired
+                               // pd_timer is disposed at completion time
 } timer_completion_payload_t;
 
 timer_actor_t* timer_actor_create(scheduler_pool_t* pool);

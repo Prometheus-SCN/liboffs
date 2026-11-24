@@ -496,6 +496,36 @@ static void _timer_actor_dispatch(void* state, message_t* msg) {
       target_msg.payload = copy;
       target_msg.payload_destroy = free;
       actor_send(copy->target, &target_msg);
+      /* One-shot disposal (OFFS-269): the timer already fired — keep or
+       * dispose? Recurring timers are reused until explicitly cancelled, but
+       * a one-shot's pd_timer would otherwise stay tracked forever (leaking
+       * its watcher + timerfd per firing) unless the caller cancels; every
+       * respiration/sweep/anti-entropy re-arm overwrote the old id without
+       * cancelling, and network.c's many set-once timers relied on the tick
+       * to re-track. Dispose the fired one-shot here: untrack it and queue
+       * the destroy for the loop thread's next drain-batch check. */
+      platform_mutex_lock(timer_actor->loop_lock);
+      pd_timer_t* fired_timer = NULL;
+      for (size_t index = 0;
+           index < timer_actor->active_timer_count && fired_timer == NULL;
+           index++) {
+        pd_timer_t* tracked_timer = timer_actor->active_timers[index];
+        if (tracked_timer->user_data == completion) {
+          fired_timer = tracked_timer;
+        }
+      }
+      uint8_t fired_one_shot = 0;
+      if (fired_timer != NULL && completion->one_shot) {
+        fired_one_shot = 1;  /* read under lock: a concurrent cancel may free
+                                the completion right after untrack */
+        _timer_actor_untrack(timer_actor, fired_timer);
+      } else {
+        fired_timer = NULL;
+      }
+      platform_mutex_unlock(timer_actor->loop_lock);
+      if (fired_timer != NULL && fired_one_shot) {
+        _timer_destroy_timer(fired_timer);
+      }
       break;
     }
     default:
@@ -669,6 +699,7 @@ uint64_t timer_actor_set(timer_actor_t* timer_actor, uint64_t timeout_ms,
   completion->target = target;
   completion->completion_type = completion_type;
   completion->timer_actor = timer_actor;
+  completion->one_shot = (interval_ms == 0);
 
   platform_mutex_lock(timer_actor->loop_lock);
   uint64_t id = 0;

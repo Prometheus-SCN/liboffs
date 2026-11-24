@@ -370,7 +370,7 @@ static void _quic_process_deframed(quic_stream_context_t* stream_ctx,
 }
 
 // QUIC stream callback — receives framed data, deframes, and forwards to network actor
-static QUIC_STATUS QUIC_API quic_stream_callback(
+QUIC_STATUS QUIC_API quic_stream_callback(
     HQUIC stream, void* context, QUIC_STREAM_EVENT* event) {
   (void)stream;
   quic_stream_context_t* stream_ctx = (quic_stream_context_t*)context;

@@ -3,6 +3,7 @@
 //
 
 #include "quic_peer_send.h"
+#include "quic_listener.h"
 #include "stream_framer.h"
 #include "connection_manager.h"
 #include "peer_connection.h"
@@ -167,4 +168,130 @@ void quic_peer_broadcast(network_t* network, cbor_item_t* cbor_msg) {
      * call cbor_decref once after broadcast completes. */
     quic_peer_send(network, peer, cbor_msg);
   }
+}
+
+/* Per-message stream send (OFFS-254 structural fix): each message rides its
+ * own unidirectional stream — a wedged receive channel can no longer hoard
+ * every subsequent frame for the peer, and msquic flow control bounds the
+ * damage to one message. The persistent stream stays reserved for the
+ * salutation/control exchange. Lifecycle: open uni stream on the peer's
+ * connection, start, send, graceful shutdown (flush, then FIN); the accept
+ * side reads one frame and the accept-side stream handler drives close via
+ * the listener's deferred stack. */
+int quic_peer_send_data(network_t* network, peer_connection_t* peer, cbor_item_t* cbor_msg) {
+  if (network == NULL || peer == NULL || cbor_msg == NULL) return -1;
+
+#ifdef HAS_MSQUIC
+  if (peer->quic_connection == NULL) {
+    log_error("quic_peer_send_data: peer has no QUIC connection");
+    return -1;
+  }
+  quic_listener_t* listener = network->quic_listener;
+  if (listener == NULL) {
+    log_error("quic_peer_send_data: no QUIC listener");
+    return -1;
+  }
+  const struct QUIC_API_TABLE* msquic = offs_msquic_open();
+  if (msquic == NULL) {
+    log_error("quic_peer_send_data: msquic API table not available");
+    return -1;
+  }
+
+  unsigned char* cbor_data = NULL;
+  size_t cbor_len = 0;
+  size_t serialized = cbor_serialize_alloc(cbor_msg, &cbor_data, &cbor_len);
+  if (cbor_data == NULL || serialized == 0) {
+    offs_msquic_close();
+    log_error("quic_peer_send_data: CBOR serialization failed");
+    return -1;
+  }
+
+  size_t frame_len = 0;
+  uint8_t* frame = stream_frame_encode(cbor_data, cbor_len, &frame_len);
+  free(cbor_data);
+  if (frame == NULL) {
+    offs_msquic_close();
+    log_error("quic_peer_send_data: stream_frame_encode failed");
+    return -1;
+  }
+
+  /* Stream context: same callback as accepted streams; this side only
+     sends, so no framer (RECEIVE never indicates on an outbound uni
+     stream). single_message=1 routes SHUTDOWN_COMPLETE to the deferred
+     StreamClose. */
+  quic_stream_context_t* stream_ctx = get_clear_memory(sizeof(quic_stream_context_t));
+  if (stream_ctx == NULL) {
+    free(frame);
+    offs_msquic_close();
+    log_error("quic_peer_send_data: failed to allocate stream context");
+    return -1;
+  }
+  stream_ctx->listener = listener;
+  stream_ctx->connection = peer->quic_connection;
+  uint32_t addr_len = sizeof(stream_ctx->peer_addr);
+  msquic->GetParam((HQUIC)peer->quic_connection, QUIC_PARAM_CONN_REMOTE_ADDRESS,
+                   &addr_len, &stream_ctx->peer_addr);
+  stream_ctx->single_message = 1;
+
+  HQUIC stream = NULL;
+  QUIC_STATUS status = msquic->StreamOpen(
+      (HQUIC)peer->quic_connection,
+      QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL,
+      quic_stream_callback,
+      stream_ctx, &stream);
+  if (QUIC_FAILED(status) || stream == NULL) {
+    free(frame);
+    free(stream_ctx);
+    offs_msquic_close();
+    log_error("quic_peer_send_data: StreamOpen failed: 0x%x", status);
+    return -1;
+  }
+  status = msquic->StreamStart(stream, QUIC_STREAM_START_FLAG_NONE);
+  if (QUIC_FAILED(status)) {
+    msquic->StreamShutdown((HQUIC)stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+    quic_listener_stream_close_deferred(listener, stream);
+    free(frame);
+    offs_msquic_close();
+    log_error("quic_peer_send_data: StreamStart failed: 0x%x", status);
+    return -1;
+  }
+
+  send_complete_context_t* send_ctx = get_clear_memory(sizeof(send_complete_context_t));
+  if (send_ctx == NULL) {
+    msquic->StreamShutdown((HQUIC)stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+    quic_listener_stream_close_deferred(listener, stream);
+    free(frame);
+    offs_msquic_close();
+    log_error("quic_peer_send_data: failed to allocate send context");
+    return -1;
+  }
+  send_ctx->frame = frame;
+  send_ctx->buf.Buffer = frame;
+  send_ctx->buf.Length = (uint32_t)frame_len;
+
+  status = msquic->StreamSend((HQUIC)stream, &send_ctx->buf, 1,
+                              QUIC_SEND_FLAG_NONE, send_ctx);
+  if (QUIC_FAILED(status)) {
+    msquic->StreamShutdown((HQUIC)stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+    quic_listener_stream_close_deferred(listener, stream);
+    free(frame);
+    free(send_ctx);
+    offs_msquic_close();
+    log_error("quic_peer_send_data: StreamSend failed: 0x%x", status);
+    return -1;
+  }
+  /* FIN after the queued data flushes — the receiver sees one complete
+     frame and an end-of-stream. SEND_COMPLETE frees send_ctx/frame. */
+  msquic->StreamShutdown((HQUIC)stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
+
+  offs_msquic_close();
+  return 0;
+
+#else /* !HAS_MSQUIC */
+  (void)network;
+  (void)peer;
+  (void)cbor_msg;
+  log_error("quic_peer_send_data: no QUIC support (HAS_MSQUIC not defined)");
+  return -1;
+#endif
 }

@@ -23,4 +23,11 @@ int quic_peer_send_path(network_t* network, node_id_t* path, uint8_t path_len, c
  * Sends to each peer in the connection manager. */
 void quic_peer_broadcast(network_t* network, cbor_item_t* cbor_msg);
 
+
+/* Per-message stream send (OFFS-254 structural fix): the message opens its
+ * own unidirectional stream, flushes with FIN, and closes via the listener's
+ * deferred stack. Salutations keep the persistent stream. */
+int quic_peer_send_data(network_t* network, peer_connection_t* peer,
+                        cbor_item_t* cbor_msg);
+
 #endif // OFFS_QUIC_PEER_SEND_H

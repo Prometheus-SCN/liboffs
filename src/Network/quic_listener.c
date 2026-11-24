@@ -62,6 +62,7 @@ void quic_send_payload_destroy(quic_send_payload_t* payload) {
 typedef struct quic_destroy_node_t {
   pd_watcher_t* watcher;
   struct quic_destroy_node_t* next;
+  HQUIC stream;   /* non-NULL: close this finished per-message stream instead */
 } quic_destroy_node_t;
 
 static void _destroy_stack_init(quic_listener_t* listener) {
@@ -72,6 +73,22 @@ static void _destroy_stack_init(quic_listener_t* listener) {
 static void PLATFORM_UNUSED _destroy_stack_push(quic_listener_t* listener, pd_watcher_t* watcher) {
   quic_destroy_node_t* node = get_clear_memory(sizeof(quic_destroy_node_t));
   node->watcher = watcher;
+  node->stream = NULL;
+  platform_mutex_lock(listener->destroy_lock);
+  node->next = listener->destroy_head;
+  listener->destroy_head = node;
+  platform_mutex_unlock(listener->destroy_lock);
+  pd_loop_async_send(listener->loop, NULL);
+}
+
+/* Queue a finished per-message stream for the listener thread to close
+ * (OFFS-254 structural fix): StreamClose must not run on a msquic worker
+ * thread, but the stream is done — deferring to the listener loop is the
+ * same pattern the watcher destroy stack uses. */
+void quic_listener_stream_close_deferred(quic_listener_t* listener, HQUIC stream) {
+  quic_destroy_node_t* node = get_clear_memory(sizeof(quic_destroy_node_t));
+  node->watcher = NULL;
+  node->stream = stream;
   platform_mutex_lock(listener->destroy_lock);
   node->next = listener->destroy_head;
   listener->destroy_head = node;
@@ -87,7 +104,11 @@ static void _destroy_stack_drain(quic_listener_t* listener) {
   platform_mutex_unlock(listener->destroy_lock);
   while (node != NULL) {
     quic_destroy_node_t* next = node->next;
-    pd_watcher_destroy(node->watcher);
+    if (node->watcher != NULL) {
+      pd_watcher_destroy(node->watcher);
+    } else if (node->stream != NULL && listener->msquic != NULL) {
+      listener->msquic->StreamClose(node->stream);
+    }
     free(node);
     node = next;
   }
@@ -289,28 +310,8 @@ size_t quic_listener__conn_track_count_for_test(quic_listener_t* listener) {
   return count;
 }
 
-// Per-stream context carrying the parent connection handle and a framer
-// for deframing received data into complete messages.
-typedef struct quic_stream_context_t {
-  quic_listener_t* listener;
-  HQUIC connection;
-  HQUIC persistent_stream;  // non-NULL if this is the persistent bidi stream
-  QUIC_ADDR peer_addr;
-  stream_framer_t* framer;
-  /* OFFS-254 hunt diagnostics (remove with the block): receive-event and
-     send-complete counters, to see whether msquic stops indicating or the
-     framer wedges. */
-  ATOMIC(uint64_t) rx_events;
-  ATOMIC(uint64_t) rx_bytes;
-  ATOMIC(uint64_t) send_completes;
-  /* Wedge watchdog (OFFS-269): sends queued on this stream whose
-     SEND_COMPLETE never fires leak their context + frame (and the channel
-     stays dark — OFFS-254). send_inflight counts quic_peer_send()s msquic
-     has not completed; send_oldest_ms is the timestamp of the oldest
-     in-flight send (0 when none). Read by the network actor's 1s sweep. */
-  ATOMIC(uint32_t) send_inflight;
-  ATOMIC(uint64_t) send_oldest_ms;
-} quic_stream_context_t;
+// (quic_stream_context_t lives in quic_listener.h since the per-message
+// stream sender constructs its own contexts — OFFS-254 structural fix.)
 
 
 /* Wedge-watchdog bookkeeping for a send queued on this stream (OFFS-269):
@@ -470,7 +471,14 @@ static QUIC_STATUS QUIC_API quic_stream_callback(
          registration drain in quic_listener_destroy never finishes (the
          daemon-stop wedge, thread-stack dumps 2026-10-21). */
       quic_listener_t* owner = stream_ctx->listener;
-      if (owner != NULL && owner->msquic != NULL &&
+      if (stream_ctx->single_message) {
+        /* Per-message stream (OFFS-254 structural fix): its whole life is
+           one message; close it now via the deferred stack (StreamClose must
+           not run on a msquic worker thread). */
+        if (owner != NULL) {
+          quic_listener_stream_close_deferred(owner, stream);
+        }
+      } else if (owner != NULL && owner->msquic != NULL &&
           ((owner->pool != NULL && atomic_load(&owner->pool->stopped)) ||
            (owner->network != NULL &&
             (atomic_load(&owner->network->actor.flags) & ACTOR_FLAG_DESTROY)))) {

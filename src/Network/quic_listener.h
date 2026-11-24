@@ -157,4 +157,30 @@ void quic_stream_ctx_note_send(void* ctx);
    the stream context obtained via msquic GetContext (0 = none in flight). */
 uint64_t quic_stream_ctx_oldest_send_ms(void* ctx);
 
-#endif // OFFS_QUIC_LISTENER_H
+
+#ifdef HAS_MSQUIC
+/* Shared per-stream context (private struct in quic_listener.c moved here for
+ * the per-message stream sender; OFFS-254 structural fix). */
+typedef struct quic_stream_context_t {
+  struct quic_listener_t* listener;
+  HQUIC connection;
+  HQUIC persistent_stream;
+  QUIC_ADDR peer_addr;
+  struct stream_framer_t* framer;
+  ATOMIC(uint64_t) rx_events;
+  ATOMIC(uint64_t) rx_bytes;
+  ATOMIC(uint64_t) send_completes;
+  ATOMIC(uint32_t) send_inflight;
+  ATOMIC(uint64_t) send_oldest_ms;
+  uint8_t single_message;
+} quic_stream_context_t;
+
+extern QUIC_STATUS QUIC_API quic_stream_callback(
+    HQUIC stream, void* context, QUIC_STREAM_EVENT* event);
+#endif /* HAS_MSQUIC */
+
+/* Queue a finished per-message stream for the listener thread to close
+ * (StreamClose must not run on a msquic worker thread). */
+void quic_listener_stream_close_deferred(quic_listener_t* listener, HQUIC stream);
+
+#endif /* OFFS_QUIC_LISTENER_H */

@@ -60,6 +60,14 @@ int conn_state_send(network_t* network, peer_connection_t* peer,
         log_error("conn_state_send: DIRECT state but no QUIC stream");
         return -1;
       }
+      /* OFFS-254 structural fix: only the salutation/control exchange rides
+         the persistent stream; every other message opens its own short-lived
+         stream so a wedged receive channel can no longer hoard all
+         subsequent frames for the peer. */
+      uint8_t conn_wire_type = wire_get_type(cbor_msg);
+      if (conn_wire_type != WIRE_SALUTATION) {
+        return quic_peer_send_data(network, peer, cbor_msg);
+      }
       return quic_peer_send(network, peer, cbor_msg);
 #else
       log_error("conn_state_send: DIRECT state but no QUIC support compiled");

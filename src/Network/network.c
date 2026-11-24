@@ -3533,6 +3533,40 @@ static void network_handle_request_timeout_tick(network_t* network,
   wanted_list_sweep(network->wanted_list, now_ms,
                     network_wanted_list_timeout_cb, network);
 
+  /* Stream-wedge watchdog (OFFS-269 / OFFS-254): a peer's persistent stream
+     can wedge so SEND_COMPLETE never fires — every further message to that
+     peer is silently lost AND leaks its send context + frame (memcheck:
+     ~447KB in 3 idle minutes). Once a send has been in flight for longer
+     than the wedge threshold, abort the whole connection silently: msquic
+     then completes (as failures) all queued sends, reclaiming the leaked
+     frames, SHUTDOWN_COMPLETE runs the normal disconnect path, and the
+     reconnect tick re-establishes a fresh stream. */
+  {
+    const uint64_t STREAM_WEDGE_TIMEOUT_MS = 5000;
+    const struct QUIC_API_TABLE* msquic = network->msquic;
+    for (size_t peer_index = 0; peer_index < network->conn_mgr.peer_count;
+         peer_index++) {
+      peer_connection_t* peer = network->conn_mgr.peers[peer_index];
+      if (peer == NULL || !peer->connected || peer->quic_stream == NULL ||
+          peer->quic_connection == NULL) {
+        continue;
+      }
+      void* ctx = msquic != NULL ? msquic->GetContext((HQUIC)peer->quic_stream)
+                                 : NULL;
+      if (ctx == NULL) continue;
+      uint64_t oldest = quic_stream_ctx_oldest_send_ms(ctx);
+      if (oldest != 0 && now_ms > oldest &&
+          now_ms - oldest > STREAM_WEDGE_TIMEOUT_MS) {
+        log_warn("network: stream wedge on peer %s — send in flight for %llu ms; "
+                 "aborting connection for reclaim + reconnect",
+                 peer->remote_node_id.str,
+                 (unsigned long long)(now_ms - oldest));
+                msquic->ConnectionShutdown((HQUIC)peer->quic_connection,
+                                   QUIC_CONNECTION_SHUTDOWN_FLAG_SILENT, 0);
+      }
+    }
+  }
+
   // Sweep closest_pending — signal expired reply_to actors with a found=0
   // NETWORK_CLOSEST_NODES_RESULT. Walk in place with the swap-with-last trick
   // so we don't skip the entry that moves into the evicted slot.

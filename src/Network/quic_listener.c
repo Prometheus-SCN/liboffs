@@ -4,6 +4,8 @@
 
 #include "msquic_singleton.h"
 #include "quic_listener.h"
+#include "../Platform/platform_time.h"
+#include <time.h>
 
 // Destroy helpers for QUIC payloads (used in both HAS_MSQUIC and stub builds)
 void quic_data_payload_destroy(quic_data_payload_t* payload) {
@@ -301,7 +303,45 @@ typedef struct quic_stream_context_t {
   ATOMIC(uint64_t) rx_events;
   ATOMIC(uint64_t) rx_bytes;
   ATOMIC(uint64_t) send_completes;
+  /* Wedge watchdog (OFFS-269): sends queued on this stream whose
+     SEND_COMPLETE never fires leak their context + frame (and the channel
+     stays dark — OFFS-254). send_inflight counts quic_peer_send()s msquic
+     has not completed; send_oldest_ms is the timestamp of the oldest
+     in-flight send (0 when none). Read by the network actor's 1s sweep. */
+  ATOMIC(uint32_t) send_inflight;
+  ATOMIC(uint64_t) send_oldest_ms;
 } quic_stream_context_t;
+
+
+/* Wedge-watchdog bookkeeping for a send queued on this stream (OFFS-269):
+ * bump the in-flight count and, on 0->1, stamp the oldest-send timestamp.
+ * Called from the network actor's worker thread with the context obtained
+ * via GetContext; safe because the fields are atomics and the context stays
+ * alive until StreamClose (which the network actor serializes against its
+ * own sweep). */
+
+/* Wedge-watchdog read side (OFFS-269): the stream's oldest in-flight send
+ * timestamp (ms since epoch), 0 when nothing is in flight. Called from the
+ * network actor's 1s sweep. */
+uint64_t quic_stream_ctx_oldest_send_ms(void* ctx) {
+  quic_stream_context_t* stream_ctx = (quic_stream_context_t*)ctx;
+  if (stream_ctx == NULL) return 0;
+  return atomic_load_explicit(&stream_ctx->send_oldest_ms,
+                              memory_order_relaxed);
+}
+
+void quic_stream_ctx_note_send(void* ctx) {
+  quic_stream_context_t* stream_ctx = (quic_stream_context_t*)ctx;
+  if (stream_ctx == NULL) return;
+  uint32_t was = atomic_fetch_add_explicit(&stream_ctx->send_inflight, 1,
+                                           memory_order_relaxed);
+  if (was == 0) {
+    /* Wall clock — the sweep compares against time(NULL)-based now_ms. */
+    atomic_store_explicit(&stream_ctx->send_oldest_ms,
+                          (uint64_t)time(NULL) * 1000ULL,
+                          memory_order_relaxed);
+  }
+}
 
 // Send-complete context — frees frame buffer and QUIC_BUFFER after msquic completes the send.
 // The QUIC_BUFFER must be heap-allocated because msquic stores a pointer to it
@@ -403,6 +443,17 @@ static QUIC_STATUS QUIC_API quic_stream_callback(
       if (send_ctx != NULL) {
         free(send_ctx->frame);
         free(send_ctx);
+      }
+      {
+        /* Wedge watchdog: retire this send from the in-flight count; when
+           the stream returns to zero, clear the oldest-timestamp so the
+           sweep cannot flag it. */
+        uint32_t was = atomic_fetch_sub_explicit(&stream_ctx->send_inflight, 1,
+                                                 memory_order_relaxed);
+        if (was <= 1) {
+          atomic_store_explicit(&stream_ctx->send_oldest_ms, 0,
+                                memory_order_relaxed);
+        }
       }
       break;
     }

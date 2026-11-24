@@ -147,4 +147,14 @@ void quic_listener__conn_track_add_for_test(quic_listener_t* listener,
                                               HQUIC connection);
 size_t quic_listener__conn_track_count_for_test(quic_listener_t* listener);
 
+
+/* Wedge-watchdog bookkeeping (OFFS-269): note a send queued on the stream
+   whose context was obtained via msquic GetContext. No-op when ctx is NULL. */
+void quic_stream_ctx_note_send(void* ctx);
+
+
+/* Wedge-watchdog read side (OFFS-269): oldest in-flight send timestamp for
+   the stream context obtained via msquic GetContext (0 = none in flight). */
+uint64_t quic_stream_ctx_oldest_send_ms(void* ctx);
+
 #endif // OFFS_QUIC_LISTENER_H

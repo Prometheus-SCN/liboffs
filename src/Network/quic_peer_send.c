@@ -10,6 +10,7 @@
 #include "../Util/allocator.h"
 #include "../Util/log.h"
 #include "../Platform/platform.h"
+#include "../Platform/platform_time.h"
 #include <cbor.h>
 #include <string.h>
 
@@ -109,15 +110,24 @@ int quic_peer_send(network_t* network, peer_connection_t* peer, cbor_item_t* cbo
       QUIC_SEND_FLAG_NONE,
       send_ctx);
 
-  /* Release our msquic reference — the API table stays valid during the send */
-  offs_msquic_close();
-
   if (QUIC_FAILED(status)) {
+    /* Release our msquic reference — the API table stays valid during the send */
+    offs_msquic_close();
     free(frame);
     free(send_ctx);
     log_error("quic_peer_send: StreamSend failed: 0x%x", status);
     return -1;
   }
+
+  /* Wedge watchdog (OFFS-269): this send rides with the stream context.
+     When its SEND_COMPLETE fires the inflight count drops back; a send that
+     never completes is visible to the network actor's 1s sweep via
+     send_inflight/send_oldest_ms (on the context stored at StreamOpen),
+     which then tears the peer down and reclaims the frame. */
+  quic_stream_ctx_note_send(msquic->GetContext((HQUIC)peer->quic_stream));
+
+  /* Release our msquic reference — the API table stays valid during the send */
+  offs_msquic_close();
 
   return 0;
 

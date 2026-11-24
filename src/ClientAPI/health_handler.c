@@ -9,6 +9,14 @@
 #include <string.h>
 #include <time.h>
 
+#if defined(__linux__)
+#include <dirent.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#elif defined(__APPLE__)
+#include <sys/resource.h>
+#endif
+
 /* Rate limit type names (RPC_TYPE_COUNT = 5) */
 static const char* rate_limit_names[] = {
   "find_block",
@@ -41,6 +49,48 @@ static const char* rpc_names[] = {
   "rate_limited",            /* WIRE_RATE_LIMITED=19 */
   "salutation"               /* WIRE_SALUTATION=20 */
 };
+
+
+/* --- self-monitoring counters (VM RSS / open descriptors) --- */
+
+#if defined(__linux__)
+static size_t health_proc_rss_bytes(void) {
+  FILE* file = fopen("/proc/self/status", "r");
+  if (file == NULL) return 0;
+  char line[128];
+  size_t rss_kb = 0;
+  while (fgets(line, sizeof(line), file) != NULL) {
+    if (strncmp(line, "VmRSS:", 6) == 0) {
+      rss_kb = (size_t)strtoul(line + 6, NULL, 10);
+      break;
+    }
+  }
+  fclose(file);
+  return rss_kb * 1024;
+}
+
+static size_t health_proc_open_handle_count(void) {
+  DIR* dir = opendir("/proc/self/fd");
+  if (dir == NULL) return 0;
+  size_t count = 0;
+  struct dirent* entry = NULL;
+  while ((entry = readdir(dir)) != NULL) {
+    if (entry->d_name[0] != '.') count++;
+  }
+  closedir(dir);
+  return count;
+}
+#elif defined(__APPLE__)
+static size_t health_proc_rss_bytes(void) {
+  struct rusage usage;
+  getrusage(RUSAGE_SELF, &usage);
+  return (size_t)usage.ru_maxrss * 1024;  /* ru_maxrss is in KB on macOS */
+}
+static size_t health_proc_open_handle_count(void) { return 0; }
+#else
+static size_t health_proc_rss_bytes(void) { return 0; }
+static size_t health_proc_open_handle_count(void) { return 0; }
+#endif
 
 health_data_t health_data_collect(const health_context_t* ctx) {
   health_data_t data;
@@ -102,6 +152,8 @@ health_data_t health_data_collect(const health_context_t* ctx) {
     data.block_cache_block_count = block_cache_count(cache);
   }
 
+  data.proc_rss_bytes = health_proc_rss_bytes();
+  data.proc_open_handles = health_proc_open_handle_count();
   return data;
 }
 
@@ -117,6 +169,8 @@ cJSON* health_data_to_json(const health_data_t* data) {
 
   cJSON_AddNumberToObject(root, "peer_count", (double)data->peer_count);
   cJSON_AddNumberToObject(root, "total_connections", (double)data->total_connections);
+  cJSON_AddNumberToObject(root, "rss_bytes", (double)data->proc_rss_bytes);
+  cJSON_AddNumberToObject(root, "open_handles", (double)data->proc_open_handles);
   cJSON_AddNumberToObject(root, "avg_hebbian_weight", (double)data->avg_hebbian_weight);
 
   /* Block cache stats */

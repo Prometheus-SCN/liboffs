@@ -17,6 +17,11 @@ int platform_core_count(void);
    no-op, -1 when the raise failed (callers log and continue). */
 int platform_raise_nofile_limit(void);
 
+/* Fill *used and *cap with the process's current open-descriptor count and
+   the effective RLIMIT_NOFILE cap. Returns 0 on success (POSIX); -1 when
+   unavailable (Windows: HANDLEs have no numeric cap, always -1). */
+int platform_nofile_usage(size_t* used, size_t* cap);
+
 #ifdef __cplusplus
 }
 #endif

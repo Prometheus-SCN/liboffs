@@ -25,6 +25,8 @@ typedef struct health_data_t {
   const char* status;
   uint64_t    uptime_seconds;
   char        node_id_str[64];
+  size_t      proc_rss_bytes;      /* resident set size (0 when unavailable) */
+  size_t      proc_open_handles;   /* open fd count (POSIX; 0 when unavailable) */
   size_t      peer_count;
   size_t      total_connections;
   float       avg_hebbian_weight;

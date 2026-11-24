@@ -38,6 +38,7 @@
 #include "../Buffer/buffer.h"
 #include "../Metrics/metrics.h"
 #include "../Platform/platform_time.h"
+#include "../Platform/platform_process.h"
 #include "../Platform/platform_random.h"
 #include "../RefCounter/refcounter.h"
 #include "../Util/allocator.h"
@@ -6857,6 +6858,26 @@ void network_dispatch(void* state, message_t* msg) {
     case NETWORK_METRICS_PUSH: {
       size_t peer_count = connection_manager_count(&network->conn_mgr);
       rate_limit_table_set_peer_count(&network->rate_limits, peer_count);
+      /* fd-pressure watchdog: descriptor exhaustion is a silent death march
+         (platform_file_open starts failing — 'sections_write FAILED
+         result=3' — long before the process dies; see OFFS-267/269). Log
+         loudly once while usage is near the cap. */
+      {
+        static uint8_t fd_pressure_logged = 0;
+        size_t fd_used = 0;
+        size_t fd_cap = 0;
+        if (!fd_pressure_logged &&
+            platform_nofile_usage(&fd_used, &fd_cap) == 0 &&
+            fd_cap > 0 && fd_cap != (size_t)-1) {
+          size_t threshold = fd_cap - fd_cap / 5;  /* 80% */
+          if (fd_used >= threshold) {
+            log_warn("network: fd pressure — %zu/%zu open descriptors "
+                     "(near RLIMIT_NOFILE); investigate leaked connections/binding fds",
+                     fd_used, fd_cap);
+            fd_pressure_logged = 1;
+          }
+        }
+      }
       if (peer_count > 0) {
         peer_metrics_snapshot_t* snapshots = get_clear_memory(peer_count * sizeof(peer_metrics_snapshot_t));
         if (snapshots != NULL) {

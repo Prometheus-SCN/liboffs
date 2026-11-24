@@ -178,6 +178,12 @@ void quic_peer_broadcast(network_t* network, cbor_item_t* cbor_msg) {
  * connection, start, send, graceful shutdown (flush, then FIN); the accept
  * side reads one frame and the accept-side stream handler drives close via
  * the listener's deferred stack. */
+#ifdef HAS_MSQUIC
+static int quic_peer_send_data_attempt(network_t* network,
+                                       peer_connection_t* peer,
+                                       cbor_item_t* cbor_msg);
+#endif
+
 int quic_peer_send_data(network_t* network, peer_connection_t* peer, cbor_item_t* cbor_msg) {
   if (network == NULL || peer == NULL || cbor_msg == NULL) return -1;
 
@@ -191,11 +197,34 @@ int quic_peer_send_data(network_t* network, peer_connection_t* peer, cbor_item_t
     log_error("quic_peer_send_data: no QUIC listener");
     return -1;
   }
-  const struct QUIC_API_TABLE* msquic = offs_msquic_open();
-  if (msquic == NULL) {
-    log_error("quic_peer_send_data: msquic API table not available");
-    return -1;
+  /* A message can race the peer connection's teardown (wedge-abort →
+     reconnect, mesh churn): StreamOpen fails INVALID_STATE even though the
+     replacement connection is already live. Retry the burst quietly — a
+     dropped per-message send costs the full 30s wanted-list timeout on the
+     consumer side. */
+  for (int attempt = 0; attempt < QUIC_PEER_DATA_SEND_ATTEMPTS; attempt++) {
+    if (attempt > 0) {
+      if (peer->quic_connection == NULL) break;
+      platform_sleep_ms(5 * attempt);
+      if (peer->quic_connection == NULL) break;
+    }
+    if (attempt == 0 || quic_peer_send_data_attempt(network, peer, cbor_msg) == 0) {
+      return 0;
+    }
   }
+  return -1;
+#else
+  (void)network;
+  (void)peer;
+  (void)cbor_msg;
+  log_error("quic_peer_send_data: no QUIC support (HAS_MSQUIC not defined)");
+  return -1;
+#endif
+}
+#ifdef HAS_MSQUIC
+static int quic_peer_send_data_attempt(network_t* network,
+                                       peer_connection_t* peer,
+                                       cbor_item_t* cbor_msg) {
 
   unsigned char* cbor_data = NULL;
   size_t cbor_len = 0;

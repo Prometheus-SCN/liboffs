@@ -418,15 +418,22 @@ QUIC_STATUS QUIC_API quic_stream_callback(
            receives the stream handle directly, which also covers accepted
            peer streams whose context carries no persistent_stream. */
         stream_ctx->listener->msquic->StreamReceiveComplete(stream, consumed);
-          /* Returning PENDING (not SUCCESS) is the msquic contract for inline
-             StreamReceiveComplete: SUCCESS makes QuicStreamIndicateEvent
-             treat the callback as buggy and auto-complete the FULL indicated
-             length AGAIN (RecvCompletionLength = consumed + total = 2x),
-             double-draining the receive buffer and silently discarding the
-             unread bytes of subsequent frames - the wedge where the peer inbound
-             goes dark after ~1.4 MB sent (2026-10-22 hunt). */
-          return QUIC_STATUS_PENDING;
+        /* Returning PENDING (not SUCCESS) is the msquic contract for inline
+           StreamReceiveComplete: SUCCESS makes QuicStreamIndicateEvent
+           treat the callback as buggy and auto-complete the FULL indicated
+           length AGAIN (RecvCompletionLength = consumed + total = 2x),
+           double-draining the receive buffer and silently discarding the
+           unread bytes of subsequent frames - the wedge where the peer inbound
+           goes dark after ~1.4 MB sent (2026-10-22 hunt). */
+        return QUIC_STATUS_PENDING;
       }
+      /* Empty indication (BufferCount==0): nothing to complete. MUST NOT fall
+         through into the SEND_COMPLETE branch below — that reads this event's
+         union as a send completion, freeing a garbage ClientContext and
+         underflowing send_inflight. */
+      break;
+    }
+    case QUIC_STREAM_EVENT_SEND_COMPLETE: {
       {
         /* OFFS-254 hunt diagnostic (remove with the block): per-stream send
             completion counter with the stream handle, so a send that msquic

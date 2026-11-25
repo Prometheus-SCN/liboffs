@@ -229,7 +229,15 @@ static int quic_peer_send_data_attempt(network_t* network,
   if (QUIC_FAILED(status) || stream == NULL) {
     free(frame);
     free(stream_ctx);
-    log_error("quic_peer_send_data: StreamOpen failed: 0x%x", status);
+    if (status == QUIC_STATUS_INVALID_STATE) {
+      /* OFFS-270: INVALID_STATE means the peer connection closed while this
+         send was being set up (wedge-abort/reconnect race). The drop is
+         recovered by the wanted-list sweep, so log it at debug — an error
+         here just floods the log during mesh churn. */
+      log_debug("quic_peer_send_data: StreamOpen raced peer teardown (INVALID_STATE): 0x%x", status);
+    } else {
+      log_error("quic_peer_send_data: StreamOpen failed: 0x%x", status);
+    }
     return -1;
   }
   status = msquic->StreamStart(stream, QUIC_STREAM_START_FLAG_NONE);
@@ -237,7 +245,11 @@ static int quic_peer_send_data_attempt(network_t* network,
     msquic->StreamShutdown((HQUIC)stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
     quic_listener_stream_close_deferred(listener, stream);
     free(frame);
-    log_error("quic_peer_send_data: StreamStart failed: 0x%x", status);
+    if (status == QUIC_STATUS_INVALID_STATE) {
+      log_debug("quic_peer_send_data: StreamStart raced peer teardown (INVALID_STATE): 0x%x", status);
+    } else {
+      log_error("quic_peer_send_data: StreamStart failed: 0x%x", status);
+    }
     return -1;
   }
 
@@ -260,7 +272,11 @@ static int quic_peer_send_data_attempt(network_t* network,
     quic_listener_stream_close_deferred(listener, stream);
     free(frame);
     free(send_ctx);
-    log_error("quic_peer_send_data: StreamSend failed: 0x%x", status);
+    if (status == QUIC_STATUS_INVALID_STATE) {
+      log_debug("quic_peer_send_data: StreamSend raced peer teardown (INVALID_STATE): 0x%x", status);
+    } else {
+      log_error("quic_peer_send_data: StreamSend failed: 0x%x", status);
+    }
     return -1;
   }
   /* FIN after the queued data flushes — the receiver sees one complete

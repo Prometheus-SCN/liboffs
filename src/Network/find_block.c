@@ -130,6 +130,18 @@ size_t find_block_roulette_wheel_select(net_node_t** candidates, float* weights,
 
 // --- FindBlock execute ---
 
+/* A ring/EABF candidate is only routable if the caller can resolve it into a
+   live connection — find forwarding resolves every hop through the
+   connection manager (network.c), so a candidate the conn mgr doesn't know
+   fails lookup and the send is dropped (OFFS-272: stale rendezvous
+   identities from prior peer generations dominated the hop list and starved
+   the live peers until the whole request died unrouted). */
+static bool find_block_hop_is_live(const connection_manager_t* conn_mgr,
+                                   const node_id_t* hop_id) {
+  if (conn_mgr == NULL) return true;
+  return connection_manager_lookup(conn_mgr, hop_id) != NULL;
+}
+
 find_block_result_e find_block_execute(
     eabf_table_t* eabf_table,
     eabf_ttl_table_t* eabf_ttl,
@@ -242,6 +254,10 @@ find_block_result_e find_block_execute(
       continue;
     }
 
+    // OFFS-272: skip ring/EABF candidates the connection manager cannot
+    // resolve — the caller would fail the lookup and drop the send.
+    if (!find_block_hop_is_live(conn_mgr, &entry->peer_id)) continue;
+
     // Use the peer's Hebbian weight. Peers below FIND_BLOCK_MIN_WEIGHT are
     // skipped (gate, not floor) — this excludes relay-admitted peers (inserted
     // at weight 0.0, below the gate) until their Hebbian weight crosses the
@@ -304,6 +320,9 @@ find_block_result_e find_block_execute(
         continue;
       }
 
+      // OFFS-272: skip candidates the connection manager cannot resolve.
+      if (!find_block_hop_is_live(conn_mgr, &node->id)) continue;
+
       // Skip nodes below minimum weight
       if (node->weight < FIND_BLOCK_MIN_WEIGHT) continue;
       // Secure mode: skip relay-admitted peers (identity not verified)
@@ -340,6 +359,9 @@ find_block_result_e find_block_execute(
                                 node->id.hash)) {
         continue;
       }
+
+      // OFFS-272: skip candidates the connection manager cannot resolve.
+      if (!find_block_hop_is_live(conn_mgr, &node->id)) continue;
 
       if (node->weight < FIND_BLOCK_MIN_WEIGHT) continue;
       // Secure mode: skip relay-admitted peers (identity not verified)

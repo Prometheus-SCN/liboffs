@@ -328,6 +328,104 @@ TEST(TestActor, TestAutoBackpressureOnMailboxOverflow) {
   actor_destroy(&actor);
 }
 
+/* Gradual muting: a send into a pressured target from a RUNNING actor is
+   counted per behavior and the mute completes at the batch boundary — never
+   mid-behavior (the F10 orphan race). These tests drive the completion
+   endpoint directly; the send-side counting needs a scheduler context. */
+TEST(TestActor, TestDeferredMuteCompletesThreshold) {
+  scheduler_pool_t* pool = scheduler_pool_create(2);
+  scheduler_pool_start(pool);
+
+  int sender_count = 0;
+  int target_count = 0;
+  actor_t sender;
+  actor_t target;
+  actor_init(&sender, &sender_count, test_dispatch, pool);
+  actor_init(&target, &target_count, test_dispatch, pool);
+
+  backpressure_apply(&target);
+  atomic_store(&sender.deferred_mute_count, ACTOR_UNSCHEDULE_MUTE_THRESHOLD);
+  sender.deferred_mute_target = &target;
+
+  actor_complete_deferred_mute(&sender);
+
+  EXPECT_NE(atomic_load(&sender.flags) & ACTOR_FLAG_MUTED, 0);
+  EXPECT_NE(atomic_load(&target.pressured_senders), (muted_sender_node_t*)nullptr);
+  EXPECT_EQ(atomic_load(&sender.deferred_mute_count), 0u);
+  EXPECT_EQ(sender.deferred_mute_target, (void*)nullptr);
+
+  /* The release path revives the sender as before. */
+  backpressure_release(&target);
+  EXPECT_EQ(atomic_load(&sender.flags) & ACTOR_FLAG_MUTED, 0);
+
+  scheduler_pool_wait_for_idle(pool);
+  scheduler_pool_stop(pool);
+  actor_destroy(&sender);
+  actor_destroy(&target);
+  scheduler_pool_destroy(pool);
+}
+
+TEST(TestActor, TestDeferredMuteDropsWhenTargetRecovered) {
+  scheduler_pool_t* pool = scheduler_pool_create(2);
+  scheduler_pool_start(pool);
+
+  int sender_count = 0;
+  int target_count = 0;
+  actor_t sender;
+  actor_t target;
+  actor_init(&sender, &sender_count, test_dispatch, pool);
+  actor_init(&target, &target_count, test_dispatch, pool);
+
+  /* Target no longer pressures (drained before the batch end) — the mute
+     must be dropped, never applied ("never seen as muted when it isn't"). */
+  atomic_store(&sender.deferred_mute_count, ACTOR_UNSCHEDULE_MUTE_THRESHOLD);
+  sender.deferred_mute_target = &target;
+
+  actor_complete_deferred_mute(&sender);
+
+  EXPECT_EQ(atomic_load(&sender.flags) & ACTOR_FLAG_MUTED, 0);
+  EXPECT_EQ(atomic_load(&target.pressured_senders), (muted_sender_node_t*)nullptr);
+  EXPECT_EQ(atomic_load(&sender.deferred_mute_count), 0u);
+  EXPECT_EQ(sender.deferred_mute_target, (void*)nullptr);
+
+  scheduler_pool_wait_for_idle(pool);
+  scheduler_pool_stop(pool);
+  actor_destroy(&sender);
+  actor_destroy(&target);
+  scheduler_pool_destroy(pool);
+}
+
+TEST(TestActor, TestGradualMuteDoesNotApplyMidBehavior) {
+  scheduler_pool_t* pool = scheduler_pool_create(2);
+  scheduler_pool_start(pool);
+
+  int sender_count = 0;
+  int target_count = 0;
+  actor_t sender;
+  actor_t target;
+  actor_init(&sender, &sender_count, test_dispatch, pool);
+  actor_init(&target, &target_count, test_dispatch, pool);
+
+  scheduler_pool_stop(pool);
+  backpressure_apply(&target);
+
+  /* A send into a pressured target NEVER mutes immediately anymore — the
+     mute completes at the batch boundary via actor_complete_deferred_mute.
+     Sends from outside a scheduler (no owner worker) are not counted. */
+  message_t msg;
+  msg.type = 1;
+  msg.payload = NULL;
+  msg.payload_destroy = NULL;
+  actor_send(&target, &msg);
+
+  EXPECT_EQ(atomic_load(&sender.flags) & ACTOR_FLAG_MUTED, 0);
+  EXPECT_EQ(atomic_load(&sender.deferred_mute_count), 0u);
+
+  actor_destroy(&sender);
+  actor_destroy(&target);
+  scheduler_pool_destroy(pool);
+}
+
 TEST(TestActor, TestBackpressureReleaseUnmutesSenders) {
   scheduler_pool_t* pool = scheduler_pool_create(2);
   scheduler_pool_start(pool);

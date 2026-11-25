@@ -18,6 +18,17 @@
 #define ACTOR_FLAG_PRESSURED 0x10
 #define ACTOR_FLAG_MUTED 0x20
 
+/* Gradual muting thresholds (pony PR #4151 shape): a send from a RUNNING
+   actor into a pressured/muted target is counted, not muted immediately.
+   The worker completes the mute between behaviors once the count crosses
+   ACTOR_UNSCHEDULE_MUTE_THRESHOLD, and the mute-park path then unschedules
+   the sender. The count resets when the remembered target stops triggering
+   or when the mute completes. Muting mid-behavior raced the target's
+   release exchange (the F10 orphan strands: a sender muted forever with
+   pending mail) — moving the mute to the batch boundary makes it
+   single-threaded per sender and deletes that race class. */
+#define ACTOR_UNSCHEDULE_MUTE_THRESHOLD 10
+
 /* MUTED + PRESSURED implement the mute-park backpressure protocol: a sender
    whose target mailbox is full is muted and PARKED (off the run queue) until
    the target's mailbox drains and releases it. Contract, caveats (notably
@@ -54,6 +65,13 @@ typedef struct actor_t {
      actor_queue_state_e above. */
   ATOMIC(uint8_t) queue_state;
   ATOMIC(muted_sender_node_t*) pressured_senders;
+  /* Deferred-mute accumulation (see ACTOR_UNSCHEDULE_MUTE_THRESHOLD).
+     deferred_mute_target is the first triggering target of the window; only
+     the actor's owning worker (the single RUNNING runner) touches both
+     fields, and actor_complete_deferred_mute consumes them at the batch
+     boundary. */
+  ATOMIC(uint32_t) deferred_mute_count;
+  struct actor_t* deferred_mute_target;
   scheduler_pool_t* pool;
   void* state;
   void (*dispatch)(void* state, message_t* msg);
@@ -82,5 +100,14 @@ bool actor_send(actor_t* actor, message_t* msg);
 bool actor_run(actor_t* actor, size_t batch_size);
 void backpressure_apply(actor_t* actor);
 void backpressure_release(actor_t* actor);
+
+/* Complete a deferred mute between behaviors (called by the worker after an
+   actor's batch): if the actor's accumulated sends into its remembered
+   pressured/muted target crossed ACTOR_UNSCHEDULE_MUTE_THRESHOLD and the
+   target still triggers, append the sender to the target's muted-send list
+   and set MUTED; the mute-park path unschedules the actor on its next pop.
+   Resets the accumulation either way. Safe to call anytime; no-op when the
+   count is empty. */
+void actor_complete_deferred_mute(actor_t* actor);
 
 #endif // OFFS_ACTOR_H

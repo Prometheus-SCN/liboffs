@@ -112,6 +112,37 @@ chunks under the 2 MB wire-framer cap, a real `errno` instead of "No error")
 are OFFS-side fixes in `offs` `src/offs/commands/put.c` and
 `src/offs/client.c`; see that repo for their documentation.
 
+## 3.4 Gradual muting (2026-11-26, ports pony PR #4151)
+
+The 2026-11-26 azure 10MB-load hunt captured three mute-path failures live
+under gdb (`dump_actors` probe): the mute-after-release orphan (sender muted
+forever when its mute CAS lost the exchange against `backpressure_release`),
+the immediate-mute-mid-behavior shape, and the whole-program mutual-mute
+freeze (network_actor ⇄ timer_actor both MUTED+PRESSURED-PARKED with 321/572
+pending mails). Fixes:
+
+- **Mute-after-release orphan** — the immediate mute was removed entirely.
+- **Gradual muting** (`actor.h` `ACTOR_UNSCHEDULE_MUTE_THRESHOLD`, default
+  10, pony's `--ponymsgstilmute`): a send from a RUNNING actor into a
+  pressured/muted target is *counted* into `deferred_mute_count` /
+  `deferred_mute_target` (owner-worker-only state); the worker completes the
+  mute at the batch boundary (`actor_complete_deferred_mute`) only if the
+  remembered target still triggers, then the mute-park path unschedules the
+  sender on its next pop. The accumulation resets when the target recovers
+  or the mute completes. A send into a pressured target never mutes
+  mid-behavior, and the mute is owner-thread-only — the CAS race class is
+  deleted, not narrowed.
+- **Mute-drain rule** (`scheduler.c` worker pop): a MUTED actor whose
+  mailbox still has work re-queues and drains instead of parking
+  (draining is what releases its senders). Parking is only for MUTED +
+  empty-mailbox actors. This closes the documented mutual-mute caveat for
+  the common case: two bidirectional actors under sustained full pressure
+  both keep draining; neither can starve the other's release.
+
+Contract updates in §4 below: "muted ⇒ unscheduled" is now "muted ⇒
+unscheduled after the threshold, applied between behaviors"; the mute-drain
+rule and the deferred-mute completion are part of the mute-park protocol.
+
 ## 4. The mute-park contract
 
 For anyone writing or reviewing actor code, the paradigm is:

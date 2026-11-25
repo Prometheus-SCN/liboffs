@@ -13,6 +13,8 @@ void actor_init(actor_t* actor, void* state, void (*dispatch)(void* state, messa
   atomic_store(&actor->flags, 0);
   atomic_store(&actor->queue_state, ACTOR_QUEUE_IDLE);
   atomic_store(&actor->pressured_senders, NULL);
+  atomic_store(&actor->deferred_mute_count, 0);
+  actor->deferred_mute_target = NULL;
   actor->pool = pool;
   actor->state = state;
   actor->dispatch = dispatch;
@@ -162,68 +164,32 @@ bool actor_send(actor_t* actor, message_t* msg) {
   }
   bool was_empty = was_empty_local;
 
-  /* Backpressure: if target is pressured, mute the sender. */
-  if (atomic_load(&actor->flags) & ACTOR_FLAG_PRESSURED) {
-    scheduler_t* self = scheduler_get_current();
-    if (self != NULL && self->current != NULL && self->current != actor) {
-      actor_t* sender = self->current;
-      /* Pony-style exemption: never mute a sender that is already muted
-         or pressured. This prevents deadlock chains where every actor in a
-         pipeline gets muted and nobody can make forward progress. */
-      if (!(atomic_load(&sender->flags) & (ACTOR_FLAG_MUTED | ACTOR_FLAG_PRESSURED))) {
-        /* Don't mute senders to an actor being torn down: backpressure_release
-           in actor_destroy has already (or is about to) drain pressured_senders,
-           and a late append here would orphan the muted_sender_node and leave
-           this sender muted forever. The message above was already pushed and
-           is drained with the queue, so skipping the mute is safe. A residual
-           TOCTOU remains (re-check reads DESTROY=false, destroy completes its
-           drains, then this CAS lands) that would need a per-actor lock to
-           close fully; actor_destroy's final drain after the queue wait
-           catches the common case. See concurrency-pass.md F10. */
-        if (!(atomic_load(&actor->flags) & ACTOR_FLAG_DESTROY)) {
-          muted_sender_node_t* msn = get_clear_memory(sizeof(muted_sender_node_t));
-          msn->sender = sender;
-          bool appended = false;
-          do {
-            /* Re-check DESTROY inside the loop: actor_destroy may have set
-               DESTROY + drained pressured_senders after our outer check. If
-               DESTROY is now set, abort the append (free msn) so it's never
-               orphaned in a drained list -> the sender isn't muted forever
-               (endlessly re-queued but never run). See concurrency-pass.md F10. */
-            if (atomic_load(&actor->flags) & ACTOR_FLAG_DESTROY) {
-              free(msn);
-              break;
-            }
-            /* Same hazard for RELEASE: backpressure_release may have already
-               exchanged the list while we were checking PRESSURED — a
-               late append orphans the node on an unpressured actor and the
-               sender stays MUTED forever with mail messages piling up
-               (observed live: azure 10MB load, network actor stranded
-               MUTED/IDLE/unscheduled with 83 pending messages, pool pending
-               362 — the wanted sweep's 1s tick stalls with it). Re-read
-               PRESSURED before appending and bail out of the mute. */
-            if (!(atomic_load(&actor->flags) & ACTOR_FLAG_PRESSURED)) {
-              free(msn);
-              break;
-            }
-            msn->next = atomic_load(&actor->pressured_senders);
-            if (atomic_compare_exchange_strong(&actor->pressured_senders, &msn->next, msn)) {
-              appended = true;
-            }
-          } while (!appended);
-          if (appended) {
-            atomic_fetch_or(&sender->flags, ACTOR_FLAG_MUTED);
-            /* The CAS may still have landed after release's exchange (the
-               check above read PRESSURED=true microseconds before). Nothing
-               will unmute a sender orphaned that way, so self-release: the
-               sender is this call's running actor (self->current), so the
-               worker re-queues it at fall-through once MUTED is cleared. A
-               stale muted_sender_node on the target's list is freed by the
-               next release/destroy walk. */
-            if (!(atomic_load(&actor->flags) & ACTOR_FLAG_PRESSURED)) {
-              atomic_fetch_and(&sender->flags, ~ACTOR_FLAG_MUTED);
-            }
+  /* Backpressure, gradual (pony PR #4151 muting shape): a send from a
+     RUNNING actor into a pressured/muted target is COUNTED, not muted
+     immediately. The owner worker applies the mute between behaviors
+     (actor_complete_deferred_mute) once the count crosses
+     ACTOR_UNSCHEDULE_MUTE_THRESHOLD. Muting mid-behavior raced the target's
+     release exchange (the F10 orphan strands: sender muted forever with
+     pending mail, observed live as the azure 10MB freeze) — moving the mute
+     to the batch boundary makes it owner-worker-only and deletes that race
+     class. Non-worker senders (listener threads, external threads) cannot
+     be muted at all, as before. */
+  {
+    uint8_t target_flags = atomic_load(&actor->flags);
+    bool target_triggers = (target_flags & (ACTOR_FLAG_PRESSURED | ACTOR_FLAG_MUTED)) != 0;
+    if (target_triggers) {
+      scheduler_t* self = scheduler_get_current();
+      if (self != NULL && self->current != NULL && self->current != actor) {
+        actor_t* sender = self->current;
+        /* Pony-style exemption: a sender that is already muted or pressured
+           is never counted toward a new mute (deadlock-chain prevention). */
+        if (!(atomic_load(&sender->flags) & (ACTOR_FLAG_MUTED | ACTOR_FLAG_PRESSURED))) {
+          /* Remember the first triggering target of the window; the mute is
+             applied toward it at the next batch boundary. */
+          if (atomic_load(&sender->deferred_mute_count) == 0) {
+            sender->deferred_mute_target = actor;
           }
+          atomic_fetch_add(&sender->deferred_mute_count, 1);
         }
       }
     }
@@ -330,4 +296,47 @@ void backpressure_release(actor_t* actor) {
     free(node);
     node = next;
   }
+}
+
+void actor_complete_deferred_mute(actor_t* actor) {
+  uint32_t count = atomic_load(&actor->deferred_mute_count);
+  if (count == 0) {
+    return;
+  }
+  actor_t* target = (actor_t*)actor->deferred_mute_target;
+  if (count >= ACTOR_UNSCHEDULE_MUTE_THRESHOLD && target != NULL &&
+      !(atomic_load(&actor->flags) & ACTOR_FLAG_DESTROY)) {
+    muted_sender_node_t* msn = get_clear_memory(sizeof(muted_sender_node_t));
+    msn->sender = actor;
+    bool appended = false;
+    for (int attempt = 0; attempt < 4 && !appended; attempt++) {
+      /* Re-verify the target still triggers before each append attempt: a
+         released (drained) target must never mute its senders — being seen
+         as muted when the target isn't pressuring is the deadlock rule
+         (see pony actor.c Rule 1). */
+      uint8_t target_flags = atomic_load(&target->flags);
+      if ((target_flags & ACTOR_FLAG_DESTROY) != 0 ||
+          (target_flags & (ACTOR_FLAG_PRESSURED | ACTOR_FLAG_MUTED)) == 0) {
+        break;
+      }
+      muted_sender_node_t* head = atomic_load(&target->pressured_senders);
+      msn->next = head;
+      appended = atomic_compare_exchange_strong(&target->pressured_senders, &head, msn);
+    }
+    if (appended) {
+      atomic_fetch_or(&actor->flags, ACTOR_FLAG_MUTED);
+      /* If the target released between the append and this re-check, the
+         node is already orphaned — self-release (the worker re-queues this
+         actor at fall-through) and leave the node for the next walk. */
+      uint8_t target_flags = atomic_load(&target->flags);
+      if ((target_flags & (ACTOR_FLAG_PRESSURED | ACTOR_FLAG_MUTED)) == 0 ||
+          (target_flags & ACTOR_FLAG_DESTROY) != 0) {
+        atomic_fetch_and(&actor->flags, ~ACTOR_FLAG_MUTED);
+      }
+    } else {
+      free(msn);
+    }
+  }
+  atomic_store(&actor->deferred_mute_count, 0);
+  actor->deferred_mute_target = NULL;
 }

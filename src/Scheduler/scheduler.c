@@ -193,6 +193,12 @@ static void* _scheduler_worker_loop(void* arg) {
       atomic_store(&actor->queue_state, ACTOR_QUEUE_RUNNING);
 
       bool has_more = actor_run(actor, ACTOR_BATCH_SIZE);
+      /* Gradual muting: complete the deferred mute between behaviors — the
+         actor is this worker's single runner (self->current), so the
+         accumulation and this completion are owner-thread-only and race
+         free. The mute-park path then unschedules the muted actor on its
+         next pop (or it drains per the mute-drain rule). */
+      actor_complete_deferred_mute(actor);
       /* Atomically decide: re-queue (RUNNING->QUEUED) or release
          (RUNNING->IDLE), and clear RUNNING. The destroyer waits for IDLE
          before freeing, so the re-queue below cannot push a freeable

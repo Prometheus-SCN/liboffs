@@ -179,58 +179,18 @@ void quic_peer_broadcast(network_t* network, cbor_item_t* cbor_msg) {
  * side reads one frame and the accept-side stream handler drives close via
  * the listener's deferred stack. */
 #ifdef HAS_MSQUIC
+#define QUIC_PEER_DATA_SEND_ATTEMPTS 4
+
 static int quic_peer_send_data_attempt(network_t* network,
                                        peer_connection_t* peer,
-                                       cbor_item_t* cbor_msg);
-#endif
-
-int quic_peer_send_data(network_t* network, peer_connection_t* peer, cbor_item_t* cbor_msg) {
-  if (network == NULL || peer == NULL || cbor_msg == NULL) return -1;
-
-#ifdef HAS_MSQUIC
-  if (peer->quic_connection == NULL) {
-    log_error("quic_peer_send_data: peer has no QUIC connection");
-    return -1;
-  }
-  quic_listener_t* listener = network->quic_listener;
-  if (listener == NULL) {
-    log_error("quic_peer_send_data: no QUIC listener");
-    return -1;
-  }
-  /* A message can race the peer connection's teardown (wedge-abort →
-     reconnect, mesh churn): StreamOpen fails INVALID_STATE even though the
-     replacement connection is already live. Retry the burst quietly — a
-     dropped per-message send costs the full 30s wanted-list timeout on the
-     consumer side. */
-  for (int attempt = 0; attempt < QUIC_PEER_DATA_SEND_ATTEMPTS; attempt++) {
-    if (attempt > 0) {
-      if (peer->quic_connection == NULL) break;
-      platform_sleep_ms(5 * attempt);
-      if (peer->quic_connection == NULL) break;
-    }
-    if (attempt == 0 || quic_peer_send_data_attempt(network, peer, cbor_msg) == 0) {
-      return 0;
-    }
-  }
-  return -1;
-#else
-  (void)network;
-  (void)peer;
-  (void)cbor_msg;
-  log_error("quic_peer_send_data: no QUIC support (HAS_MSQUIC not defined)");
-  return -1;
-#endif
-}
-#ifdef HAS_MSQUIC
-static int quic_peer_send_data_attempt(network_t* network,
-                                       peer_connection_t* peer,
+                                       const struct QUIC_API_TABLE* msquic,
+                                       quic_listener_t* listener,
                                        cbor_item_t* cbor_msg) {
 
   unsigned char* cbor_data = NULL;
   size_t cbor_len = 0;
   size_t serialized = cbor_serialize_alloc(cbor_msg, &cbor_data, &cbor_len);
   if (cbor_data == NULL || serialized == 0) {
-    offs_msquic_close();
     log_error("quic_peer_send_data: CBOR serialization failed");
     return -1;
   }
@@ -239,7 +199,6 @@ static int quic_peer_send_data_attempt(network_t* network,
   uint8_t* frame = stream_frame_encode(cbor_data, cbor_len, &frame_len);
   free(cbor_data);
   if (frame == NULL) {
-    offs_msquic_close();
     log_error("quic_peer_send_data: stream_frame_encode failed");
     return -1;
   }
@@ -251,7 +210,6 @@ static int quic_peer_send_data_attempt(network_t* network,
   quic_stream_context_t* stream_ctx = get_clear_memory(sizeof(quic_stream_context_t));
   if (stream_ctx == NULL) {
     free(frame);
-    offs_msquic_close();
     log_error("quic_peer_send_data: failed to allocate stream context");
     return -1;
   }
@@ -271,7 +229,6 @@ static int quic_peer_send_data_attempt(network_t* network,
   if (QUIC_FAILED(status) || stream == NULL) {
     free(frame);
     free(stream_ctx);
-    offs_msquic_close();
     log_error("quic_peer_send_data: StreamOpen failed: 0x%x", status);
     return -1;
   }
@@ -280,7 +237,6 @@ static int quic_peer_send_data_attempt(network_t* network,
     msquic->StreamShutdown((HQUIC)stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
     quic_listener_stream_close_deferred(listener, stream);
     free(frame);
-    offs_msquic_close();
     log_error("quic_peer_send_data: StreamStart failed: 0x%x", status);
     return -1;
   }
@@ -290,7 +246,6 @@ static int quic_peer_send_data_attempt(network_t* network,
     msquic->StreamShutdown((HQUIC)stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
     quic_listener_stream_close_deferred(listener, stream);
     free(frame);
-    offs_msquic_close();
     log_error("quic_peer_send_data: failed to allocate send context");
     return -1;
   }
@@ -305,7 +260,6 @@ static int quic_peer_send_data_attempt(network_t* network,
     quic_listener_stream_close_deferred(listener, stream);
     free(frame);
     free(send_ctx);
-    offs_msquic_close();
     log_error("quic_peer_send_data: StreamSend failed: 0x%x", status);
     return -1;
   }
@@ -313,8 +267,49 @@ static int quic_peer_send_data_attempt(network_t* network,
      frame and an end-of-stream. SEND_COMPLETE frees send_ctx/frame. */
   msquic->StreamShutdown((HQUIC)stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
 
-  offs_msquic_close();
   return 0;
+}
+
+#endif
+
+int quic_peer_send_data(network_t* network, peer_connection_t* peer, cbor_item_t* cbor_msg) {
+  if (network == NULL || peer == NULL || cbor_msg == NULL) return -1;
+
+#ifdef HAS_MSQUIC
+  if (peer->quic_connection == NULL) {
+    log_error("quic_peer_send_data: peer has no QUIC connection");
+    return -1;
+  }
+  quic_listener_t* listener = network->quic_listener;
+  if (listener == NULL) {
+    log_error("quic_peer_send_data: no QUIC listener");
+    return -1;
+  }
+  const struct QUIC_API_TABLE* msquic = offs_msquic_open();
+  if (msquic == NULL) {
+    log_error("quic_peer_send_data: msquic API table not available");
+    return -1;
+  }
+
+  /* A message can race the peer connection's teardown (wedge-abort →
+     reconnect, mesh churn): StreamOpen fails INVALID_STATE even though the
+     replacement connection is already live. Retry quietly — a dropped
+     per-message send costs the full 30s wanted-list timeout on the
+     consumer side. */
+  for (int attempt = 0; attempt < QUIC_PEER_DATA_SEND_ATTEMPTS; attempt++) {
+    if (attempt > 0) {
+      if (peer->quic_connection == NULL) break;
+      platform_sleep_ms(5u * (unsigned int)attempt);
+      if (peer->quic_connection == NULL) break;
+    }
+    if (quic_peer_send_data_attempt(network, peer, msquic, listener, cbor_msg) == 0) {
+      offs_msquic_close();
+      return 0;
+    }
+  }
+
+  offs_msquic_close();
+  return -1;
 
 #else /* !HAS_MSQUIC */
   (void)network;

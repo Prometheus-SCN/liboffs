@@ -1034,7 +1034,16 @@ int quic_listener_start(quic_listener_t* listener, const char* host, uint16_t po
 
   // Open configuration
   QUIC_SETTINGS settings = {0};
-  settings.PeerUnidiStreamCount = 1;
+  /* Per-message streams (OFFS-254) open one unidirectional stream per wire
+     message and rely on prompt close-recycling to stay under the peer's
+     stream limit. Advertising 1 made a single wedged stream close consume
+     the peer's only uni-stream slot forever — every later send stayed queued
+     in msquic's pending-open table, silently unsent (observed on azure:
+     finds accepted with send=0 that no receiver ever saw, loads degrading
+     mid-transfer). 65535 (the 16-bit transport-parameter ceiling) removes
+     the wall; the per-stream memory only materializes as streams actually
+     open. See msquic QUIC_SETTINGS.PeerUnidiStreamCount. */
+  settings.PeerUnidiStreamCount = 65535;
   settings.PeerBidiStreamCount = 1;
   settings.IsSet.PeerUnidiStreamCount = TRUE;
   settings.IsSet.PeerBidiStreamCount = TRUE;

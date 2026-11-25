@@ -509,9 +509,15 @@ static void _timer_actor_dispatch(void* state, message_t* msg) {
       for (size_t index = 0;
            index < timer_actor->active_timer_count && fired_timer == NULL;
            index++) {
-        pd_timer_t* tracked_timer = timer_actor->active_timers[index];
-        if (tracked_timer->user_data == completion) {
-          fired_timer = tracked_timer;
+        /* Match by timer_id: msg->payload is the per-firing COPY of the
+           tracked timer's original completion, so pointer equality never
+           matches. The tracked original stays alive while tracked, so
+           reading its timer_id is safe under loop_lock. */
+        timer_completion_payload_t* original =
+            (timer_completion_payload_t*)timer_actor->active_timers[index]->user_data;
+        if (original != NULL && original->timer_id == completion->timer_id &&
+            original->timer_actor == completion->timer_actor) {
+          fired_timer = timer_actor->active_timers[index];
         }
       }
       uint8_t fired_one_shot = 0;

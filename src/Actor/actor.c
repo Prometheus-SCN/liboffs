@@ -194,6 +194,18 @@ bool actor_send(actor_t* actor, message_t* msg) {
               free(msn);
               break;
             }
+            /* Same hazard for RELEASE: backpressure_release may have already
+               exchanged the list while we were checking PRESSURED — a
+               late append orphans the node on an unpressured actor and the
+               sender stays MUTED forever with mail messages piling up
+               (observed live: azure 10MB load, network actor stranded
+               MUTED/IDLE/unscheduled with 83 pending messages, pool pending
+               362 — the wanted sweep's 1s tick stalls with it). Re-read
+               PRESSURED before appending and bail out of the mute. */
+            if (!(atomic_load(&actor->flags) & ACTOR_FLAG_PRESSURED)) {
+              free(msn);
+              break;
+            }
             msn->next = atomic_load(&actor->pressured_senders);
             if (atomic_compare_exchange_strong(&actor->pressured_senders, &msn->next, msn)) {
               appended = true;
@@ -201,6 +213,16 @@ bool actor_send(actor_t* actor, message_t* msg) {
           } while (!appended);
           if (appended) {
             atomic_fetch_or(&sender->flags, ACTOR_FLAG_MUTED);
+            /* The CAS may still have landed after release's exchange (the
+               check above read PRESSURED=true microseconds before). Nothing
+               will unmute a sender orphaned that way, so self-release: the
+               sender is this call's running actor (self->current), so the
+               worker re-queues it at fall-through once MUTED is cleared. A
+               stale muted_sender_node on the target's list is freed by the
+               next release/destroy walk. */
+            if (!(atomic_load(&actor->flags) & ACTOR_FLAG_PRESSURED)) {
+              atomic_fetch_and(&sender->flags, ~ACTOR_FLAG_MUTED);
+            }
           }
         }
       }

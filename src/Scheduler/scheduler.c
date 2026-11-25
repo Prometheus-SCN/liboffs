@@ -151,13 +151,33 @@ static void* _scheduler_worker_loop(void* arg) {
            after it, a concurrent destroyer may free the actor, so nothing may
            touch it afterwards. */
         atomic_fetch_and(&actor->flags, ~ACTOR_FLAG_SCHEDULED);
-        uint8_t recheck = atomic_load(&actor->flags);
-        if (recheck & (ACTOR_FLAG_MUTED | ACTOR_FLAG_DESTROY)) {
-          atomic_store(&actor->queue_state, ACTOR_QUEUE_IDLE);
-          self->current = NULL;
-          continue;
+        /* Park only when the actor has no work of its own: the mute-park
+           contract says a target never stops running because of its own
+           mailbox, but parking a muted actor with pending messages stops it
+           draining entirely — observed live as the whole-program mutual-mute
+           freeze (network_actor <-> timer_actor both MUTED+PRESSURED with
+           321/572 pending, all 16 workers idle, 1.1k undelivered messages;
+           azure 10MB load). A muted actor WITH pending work re-queues and
+           drains — draining is what unmutes it; with an empty mailbox
+           parking is the old (correct) behavior: no work, no spin since
+           pops return nothing until a release re-injects. */
+        if (atomic_load(&actor->queue.size) > 0) {
+          uint8_t recheck = atomic_load(&actor->flags);
+          if (recheck & (ACTOR_FLAG_MUTED | ACTOR_FLAG_DESTROY)) {
+            /* Still muted with work pending — re-queue (drain, don't park). */
+            deque_push(&self->local_queue, (void*)actor);
+            continue;
+          }
+          /* Released while we were parking — run it this iteration. */
+        } else {
+          uint8_t recheck = atomic_load(&actor->flags);
+          if (recheck & (ACTOR_FLAG_MUTED | ACTOR_FLAG_DESTROY)) {
+            atomic_store(&actor->queue_state, ACTOR_QUEUE_IDLE);
+            self->current = NULL;
+            continue;
+          }
+          /* Released while we were parking — run it this iteration. */
         }
-        /* Released while we were parking — run it this iteration. */
       }
       if (flags & ACTOR_FLAG_RUNNING) {
         /* Another worker is already running this actor; re-queue it */

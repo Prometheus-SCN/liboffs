@@ -80,3 +80,7 @@ examples/off_client/test/
 examples/off_client/.metadata
 Testing/
 OFFS
+
+# Integration-test droppings (test-generate_ssl_certs writes pairs into CWD)
+/test_ssl_cert_*.pem
+/test_ssl_key_*.pem

@@ -3,6 +3,7 @@
 //
 
 #include "block_cache.h"
+#include "../../deps/BLAKE3/c/blake3.h"
 #include "sections.h"
 #include "../Network/authority.h"
 #include "../Network/respiration.h"
@@ -966,41 +967,93 @@ void block_cache_dispatch(void* state, message_t* msg) {
       break;
     }
     case SECTIONS_READ_RESULT: {
-      /* Async: sections read completed — resolve all pending gets for this section */
+      /* Async: sections read completed — resolve all pending gets for this
+         section. The read data is hashed ONCE and each pending get is
+         verified against ITS OWN entry hash: a section slot can be
+         double-claimed after crash recovery (OFFS-275 — 15 slots in one
+         archived index claimed by two to three different blocks), so
+         verifying only the first pending's hash made the correct block's
+         requesters miss too whenever an arbitrary pending was found first. */
       sections_read_result_payload_t* p = (sections_read_result_payload_t*)msg->payload;
       buffer_t* data = p->data;
       block_t* block = NULL;
+      index_entry_t* matched_entry = NULL;
+      buffer_t* data_hash = NULL;
       if (data != NULL) {
-        /* We need the entry to get the hash — find first pending to get it */
-        pending_get_t* first_pending = _block_cache_find_pending_get(block_cache,
-                                                                      p->section_id, p->section_index);
-        if (first_pending != NULL) {
-          if (block_cache_verify_read_hash(data, first_pending->entry->hash)) {
-            block = block_create_existing_data_hash(data, first_pending->entry->hash);
-          } else {
-            log_error("block_cache: async read hash mismatch for section %u index %u — treating as miss",
-                      (unsigned)p->section_id, (unsigned)p->section_index);
+        data_hash = hash_data(data);
+        if (data_hash == NULL) {
+          log_error("block_cache: async read of section %u index %u — hashing failed",
+                    (unsigned)p->section_id, (unsigned)p->section_index);
+        }
+      }
+      {
+        pending_get_t** current = &block_cache->pending_gets;
+        while (current != NULL) {
+          pending_get_t* found = *current;
+          if (found == NULL) {
+            break;
           }
-          if (block != NULL) {
-            index_entry_t* ejection = (index_entry_t*)refcounter_reference(
-                (refcounter_t*)block_lru_cache_put(block_cache->lru, block, first_pending->entry));
-            if (ejection) {
-              index_set_entry_ejection(block_cache->index, ejection, time(NULL));
-              timer_actor_debounce(block_cache->timer_actor, block_cache->index_wait, 0, &block_cache->actor, INDEX_SAVE);
-              index_entry_destroy(ejection);
+          if (found->entry->section_id == p->section_id &&
+              found->entry->section_index == p->section_index) {
+            *current = found->next;  /* unlink before replying */
+            index_entry_t* entry = found->entry;
+            int is_hit = (data_hash != NULL &&
+                          entry->hash != NULL &&
+                          entry->hash->size == BLAKE3_OUT_LEN &&
+                          data_hash->size == BLAKE3_OUT_LEN &&
+                          memcmp(entry->hash->data, data_hash->data, BLAKE3_OUT_LEN) == 0);
+            cache_get_result_payload_t* result =
+                get_clear_memory(sizeof(cache_get_result_payload_t));
+            result->hash = found->hash;  /* moved: freed by the payload destroy */
+            found->hash = NULL;
+            result->reply_to = NULL;
+            result->entry_existed = 1;
+            result->ephemeral_entry = (uint8_t)(entry->ephemeral_count > 0);
+            result->no_data = 0;
+            if (is_hit) {
+              if (block == NULL) {
+                block = block_create_existing_data_hash(data, entry->hash);
+                matched_entry = entry;
+              }
+              result->block = block ? (block_t*)refcounter_reference((refcounter_t*)block) : NULL;
+              result->fib = entry->counter.fib;
+            } else {
+              /* The slot holds different bytes than this entry claims: a
+                 stale double-claim. Reply miss — the requester's find path
+                 re-serves it from the network. */
+              result->block = NULL;
+              result->fib = 0;
+              log_debug("block_cache: async read of section %u index %u does not match %.8s (stale claim) — treating as miss",
+                        (unsigned)p->section_id, (unsigned)p->section_index,
+                        (const char*)entry->hash->data);
             }
+            message_t reply;
+            reply.type = CACHE_GET_RESULT;
+            reply.payload = result;
+            reply.payload_destroy = cache_get_result_payload_destroy;
+            actor_send(found->reply_to, &reply);
+            index_entry_destroy(entry);
+            found->entry = NULL;
+            free(found);
+            /* Don't advance current - the list head may have changed */
+          } else {
+            current = &(*current)->next;
           }
-          /* Re-add the first pending so _resolve_all can find it along with others */
-          first_pending->next = block_cache->pending_gets;
-          block_cache->pending_gets = first_pending;
         }
       }
 
-      /* Resolve ALL pending gets for this section, not just the first one */
-      _block_cache_resolve_pending_gets(block_cache, p->section_id, p->section_index, block);
-
       if (block != NULL) {
+        index_entry_t* ejection = (index_entry_t*)refcounter_reference(
+            (refcounter_t*)block_lru_cache_put(block_cache->lru, block, matched_entry));
+        if (ejection) {
+          index_set_entry_ejection(block_cache->index, ejection, time(NULL));
+          timer_actor_debounce(block_cache->timer_actor, block_cache->index_wait, 0, &block_cache->actor, INDEX_SAVE);
+          index_entry_destroy(ejection);
+        }
         block_destroy(block);
+      }
+      if (data_hash != NULL) {
+        buffer_destroy(data_hash);
       }
       if (data != NULL) {
         buffer_destroy(data);

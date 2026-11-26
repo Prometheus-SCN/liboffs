@@ -1062,6 +1062,15 @@ int quic_listener_start(quic_listener_t* listener, const char* host, uint16_t po
   settings.IsSet.IdleTimeoutMs = TRUE;
   settings.KeepAliveIntervalMs = 15000;
   settings.IsSet.KeepAliveIntervalMs = TRUE;
+  /* Per-message streams are one-shot: each fresh uni stream starts at the
+     default 64KB flow-control window, so a 128KB block transfer always
+     stalled mid-block for a WINDOW_UPDATE round trip (~1 extra RTT per
+     block, 246 blocks per 10MB load). 256KB covers a full block plus
+     headroom in one window — no mid-block stall, and auto-tuning still
+     grows it further under sustained pressure. See QUIC_DEFAULT_STREAM_
+     FC_WINDOW_SIZE in the vendored msquic (0x10000 default). */
+  settings.StreamRecvWindowDefault = 256 * 1024;
+  settings.IsSet.StreamRecvWindowDefault = TRUE;
 
   if (QUIC_FAILED(status = listener->msquic->ConfigurationOpen(
           listener->registration,

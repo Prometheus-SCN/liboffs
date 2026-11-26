@@ -409,6 +409,145 @@ TEST_F(TestBlockCache, TestBlockCachePutOnly) {
   EXPECT_EQ(block_cache_count(block_cache), BLOCK_COUNT);
 }
 
+
+/* ---- CACHE_LIST_SERVABLE: top-K offer list ---- */
+
+typedef struct ls_capture_s {
+  ATOMIC(uint8_t) done;
+  cache_list_servable_result_payload_t* result;
+} ls_capture_t;
+
+static void _ls_capture_dispatch(void* state, message_t* msg) {
+  ls_capture_t* capture = (ls_capture_t*)state;
+  if (msg->type == CACHE_LIST_SERVABLE_RESULT) {
+    capture->result = (cache_list_servable_result_payload_t*)msg->payload;
+    /* CONSUME: actor_run's post-dispatch cleanup must not double-free. */
+    msg->payload = NULL;
+    msg->payload_destroy = NULL;
+  }
+  atomic_store(&capture->done, 1);
+}
+
+static cache_list_servable_result_payload_t* ls_servable_sync(
+    block_cache_t* bc, size_t max_offers, const uint8_t* exclude,
+    size_t exclude_count, scheduler_pool_t* pool) {
+  static ATOMIC(uint64_t) ls_message_id = ATOMIC_VAR_INIT(1);
+  ls_capture_t capture;
+  atomic_store(&capture.done, 0);
+  capture.result = NULL;
+
+  actor_t comp;
+  actor_init(&comp, &capture, _ls_capture_dispatch, pool);
+
+  uint64_t message_id = atomic_fetch_add(&ls_message_id, 1) + 1;
+  block_cache_list_servable(bc, max_offers, exclude, exclude_count,
+                            message_id, &comp);
+
+  if (pool != NULL) {
+    while (!atomic_load(&capture.done)) {
+      platform_sleep_ms(1);
+    }
+    scheduler_pool_wait_for_idle(pool);
+  } else {
+    while (!atomic_load(&capture.done)) {
+      actor_run(&bc->actor, ACTOR_BATCH_SIZE);
+      actor_run(&comp, ACTOR_BATCH_SIZE);
+    }
+  }
+  actor_destroy(&comp);
+  return capture.result;
+}
+
+/* Correctness: FIB-descending top-K over servable entries; excluded and
+   ephemeral entries never offered. */
+TEST_F(TestBlockCache, TestBlockCacheListServableTopKAndExclusions) {
+  block_cache = block_cache_create(config, location, type, timer_actor, pool, NULL, 0);
+
+  for (size_t i = 0; i < BLOCK_COUNT; i++) {
+    EXPECT_EQ(bc_put_sync(block_cache, blocks[i], pool), CACHE_PUT_NEW);
+  }
+  /* Distinct FIB per entry: entry i gets fib i+1 (put counters reset below). */
+  for (size_t i = 0; i < BLOCK_COUNT; i++) {
+    index_entry_t* entry =
+        index_get(block_cache->index, blocks[i]->hash);
+    ASSERT_NE(entry, nullptr);
+    entry->counter = fibonacci_hit_counter_from(i + 1, 1);
+  }
+  /* Two ephemeral entries drop out of the servable set. */
+  index_entry_t* ephemeral_low = index_get(block_cache->index, blocks[0]->hash);
+  index_entry_t* ephemeral_high = index_get(block_cache->index, blocks[BLOCK_COUNT - 1]->hash);
+  ASSERT_NE(ephemeral_low, nullptr);
+  ASSERT_NE(ephemeral_high, nullptr);
+  ephemeral_low->ephemeral_count = 3;
+  ephemeral_high->ephemeral_count = 3;
+
+  /* Exclude the two highest surviving fibs (BLOCK_COUNT-1, BLOCK_COUNT-2). */
+  uint8_t exclude[2 * 32];
+  memcpy(exclude, blocks[BLOCK_COUNT - 2]->hash->data, 32);
+  memcpy(exclude + 32, blocks[BLOCK_COUNT - 3]->hash->data, 32);
+
+  cache_list_servable_result_payload_t* result =
+      ls_servable_sync(block_cache, 20, exclude, 2, pool);
+  ASSERT_NE(result, nullptr);
+
+  const size_t expected_count = 20;
+  ASSERT_NE(result->hashes, nullptr);
+  ASSERT_EQ(result->offer_count, expected_count);
+
+  /* Strictly descending fibs, and the excluded sets never appear. The
+     highest servable non-excluded fib is BLOCK_COUNT-4 (indices 22.21 excluded. */
+  for (size_t rank = 0; rank < result->offer_count; rank++) {
+    uint32_t expected_fib = (uint32_t)(BLOCK_COUNT - 3 - rank);
+    EXPECT_EQ(result->fibs[rank], expected_fib) << "rank " << rank;
+    for (size_t ex = 0; ex < 2; ex++) {
+      EXPECT_NE(memcmp(result->hashes + rank * 32, exclude + ex * 32, 32), 0);
+    }
+    EXPECT_NE(memcmp(result->hashes + rank * 32,
+                     blocks[BLOCK_COUNT - 1]->hash->data, 32), 0);
+    EXPECT_NE(memcmp(result->hashes + rank * 32, blocks[0]->hash->data, 32), 0);
+  }
+
+  DESTROY(result, cache_list_servable_result_payload);
+}
+
+/* Bounded runtime: the offer list is a TOP-K selection — the previous full
+   O(n^2) bubble sort made a single reply take seconds on a 60k index and
+   starved consumer cache lookups behind the seek flood (azure 10MB load,
+   2026-11-26). 60k entries must answer within 5s. */
+TEST_F(TestBlockCache, TestBlockCacheListServableScalesLinear) {
+  block_cache = block_cache_create(config, location, type, timer_actor, pool, NULL, 0);
+
+  const size_t big_count = 60000;
+  for (size_t i = 0; i < big_count; i++) {
+    /* 32 distinct bytes: the 8-byte counter, then its byte-wise repeat. */
+    uint8_t raw[32];
+    memset(raw, 0, sizeof(raw));
+    memcpy(raw, &i, sizeof(i));
+    memcpy(raw + 16, &i, sizeof(i));
+    buffer_t* hash_buf = buffer_create_from_pointer_copy(raw, 32);
+    index_entry_t* entry = index_entry_from(
+        hash_buf, 0, 0, 0, fibonacci_hit_counter_from((uint64_t)(i + 1), 1), 0, 0);
+    buffer_destroy(hash_buf);
+    index_add(block_cache->index, entry);
+  }
+  EXPECT_EQ(index_count(block_cache->index), big_count);
+
+  const long long start_ms = (long long)(time(NULL) * 1000LL);
+  cache_list_servable_result_payload_t* result =
+      ls_servable_sync(block_cache, 20, NULL, 0, pool);
+  const long long elapsed_ms = (long long)(time(NULL) * 1000LL) - start_ms;
+
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(result->offer_count, 20u);
+  /* Top-K: the highest fibs land first (60000, 59999, ...). */
+  EXPECT_EQ(result->fibs[0], 60000u);
+  EXPECT_EQ(result->fibs[19], 59981u);
+
+  EXPECT_LT(elapsed_ms, 5000) << "list-servable took " << elapsed_ms << "ms";
+
+  DESTROY(result, cache_list_servable_result_payload);
+}
+
 TEST_F(TestBlockCache, TestPutGroupAbortDeletesCreatedBlocks) {
   block_cache = block_cache_create(config, location, type, timer_actor, pool, NULL, 0);
 

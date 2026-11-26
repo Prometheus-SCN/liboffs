@@ -1263,12 +1263,19 @@ void block_cache_dispatch(void* state, message_t* msg) {
 
       index_entry_vec_t* entries = index_to_array(block_cache->index);
       if (entries != NULL && max_offers > 0) {
-        /* First pass: collect servable, non-excluded candidates. */
+        /* Only the top max_offers entries by FIB are offered: a bounded
+           insertion into a max_offers-sized window keeps one seek reply at
+           O(n*K). The previous full O(n^2) bubble sort over the servable set
+           cost seconds per reply on a large index (56k entries ≈ 3.5k ms),
+           and the seek flood then starved every consumer cache lookup
+           behind hours of backlog in this actor's mailbox (azure 10MB load,
+           2026-11-26). Ties keep the earlier index order (the bubble sort
+           was stable; equal fibs never swapped). */
         typedef struct fib_candidate_s {
           index_entry_t* entry;
         } fib_candidate_t;
-        fib_candidate_t* candidates = NULL;
-        size_t candidate_count = 0;
+        fib_candidate_t* top = get_clear_memory(sizeof(fib_candidate_t) * max_offers);
+        size_t top_count = 0;
         for (size_t entry_idx = 0; entry_idx < entries->length; entry_idx++) {
           index_entry_t* entry = entries->data[entry_idx];
           if (entry == NULL || entry->hash == NULL) continue;
@@ -1282,39 +1289,39 @@ void block_cache_dispatch(void* state, message_t* msg) {
             }
           }
           if (excluded) continue;
-          if (candidate_count == 0) {
-            candidates =
-                get_clear_memory(sizeof(fib_candidate_t) * entries->length);
+
+          size_t insert_pos;
+          if (top_count < max_offers) {
+            insert_pos = top_count;
+          } else if (entry->counter.fib <= top[max_offers - 1].entry->counter.fib) {
+            continue;
+          } else {
+            insert_pos = max_offers - 1;
           }
-          candidates[candidate_count].entry = entry;
-          candidate_count++;
-        }
-        /* FIB descending (highest FIB = most important). */
-        for (size_t i = 0; i < candidate_count; i++) {
-          for (size_t j = i + 1; j < candidate_count; j++) {
-            if (candidates[j].entry->counter.fib >
-                candidates[i].entry->counter.fib) {
-              fib_candidate_t swapped = candidates[i];
-              candidates[i] = candidates[j];
-              candidates[j] = swapped;
-            }
+          while (insert_pos > 0 &&
+                 top[insert_pos - 1].entry->counter.fib < entry->counter.fib) {
+            insert_pos--;
           }
+          if (top_count < max_offers) {
+            top_count++;
+          }
+          for (size_t shift_index = top_count - 1; shift_index > insert_pos; shift_index--) {
+            top[shift_index] = top[shift_index - 1];
+          }
+          top[insert_pos].entry = entry;
         }
-        const size_t out_count = candidate_count < max_offers
-                                     ? candidate_count : max_offers;
+        const size_t out_count = top_count;
         if (out_count > 0) {
           result->hashes = get_clear_memory(32 * out_count);
           result->fibs = get_clear_memory(sizeof(uint32_t) * out_count);
           for (size_t i = 0; i < out_count; i++) {
-            index_entry_t* entry = candidates[i].entry;
+            index_entry_t* entry = top[i].entry;
             memcpy(result->hashes + i * 32, entry->hash->data, 32);
             result->fibs[i] = entry->counter.fib;
           }
           result->offer_count = out_count;
         }
-        if (candidates != NULL) {
-          free(candidates);
-        }
+        free(top);
       }
       if (entries != NULL) {
         for (size_t entry_idx = 0; entry_idx < entries->length; entry_idx++) {

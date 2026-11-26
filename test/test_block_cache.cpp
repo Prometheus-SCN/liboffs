@@ -548,6 +548,74 @@ TEST_F(TestBlockCache, TestBlockCacheListServableScalesLinear) {
   DESTROY(result, cache_list_servable_result_payload);
 }
 
+
+/* Crash-recovery split (OFFS-275): the index snapshot+WAL and the sections'
+   free-map meta are restored from independent persistence timelines. A
+   SIGKILL between their flushes leaves a slot marked FREE in the recovered
+   free map while an index entry still claims it; the next write then
+   re-allocated the slot, double-claiming it (15 such slots in one archived
+   azure index). Reconciliation at cache create must re-occupy every live
+   index claim before any new write allocates. */
+TEST_F(TestBlockCache, TestBlockCacheSlotReconciliationAfterCrashSplit) {
+  /* One slot per section makes the allocator deterministic: the flipped
+     slot in A's section is the ONLY free slot a post-crash write could
+     take. */
+  config.section_size = 1;
+
+  block_cache = block_cache_create(config, location, type, timer_actor, pool, NULL, 0);
+  ASSERT_NE(block_cache, nullptr);
+
+  EXPECT_EQ(bc_put_sync(block_cache, blocks[0], pool), CACHE_PUT_NEW);
+  index_entry_t* entry_a = index_get(block_cache->index, blocks[0]->hash);
+  ASSERT_NE(entry_a, nullptr);
+  size_t a_sid = entry_a->section_id;
+  size_t a_idx = entry_a->section_index;
+
+  /* Persist everything (index snapshot + section meta). */
+  block_cache_sync(block_cache);
+  block_cache_destroy(block_cache);
+  block_cache = NULL;
+  scheduler_pool_wait_for_idle(pool);
+
+  /* Simulate the crash split: the section meta on disk still shows the
+     slot FREE (its flush lost the race against SIGKILL). */
+  char meta_path[1024];
+  snprintf(meta_path, sizeof(meta_path), "%s/blocks/meta/%zu", location, a_sid);
+  FILE* meta = fopen(meta_path, "r+b");
+  ASSERT_NE(meta, nullptr);
+  uint8_t meta_bytes[512];
+  size_t meta_len = fread(meta_bytes, 1, sizeof(meta_bytes), meta);
+  ASSERT_GE(meta_len, 5u);
+  size_t byte_offset = 4 + a_idx / 8;
+  ASSERT_LT(byte_offset, meta_len);
+  meta_bytes[byte_offset] |= (uint8_t)(1 << (a_idx % 8)); /* 1 = free */
+  fseek(meta, 0, SEEK_SET);
+  fwrite(meta_bytes, 1, meta_len, meta);
+  fclose(meta);
+
+  /* Recreate: reconciliation must re-occupy the claimed slot. */
+  block_cache = block_cache_create(config, location, type, timer_actor, pool, NULL, 0);
+  ASSERT_NE(block_cache, nullptr);
+
+  section_t* section_a = sections_lru_cache_get(block_cache->sections->lru, a_sid);
+  ASSERT_NE(section_a, nullptr);
+  EXPECT_EQ(section_slot_occupied(section_a, a_idx), 1)
+      << "index-claimed slot left FREE after crash-split restore";
+
+  /* The next write must NOT reuse the still-claimed slot. */
+  ASSERT_EQ(bc_put_sync(block_cache, blocks[1], pool), CACHE_PUT_NEW);
+  index_entry_t* entry_b = index_get(block_cache->index, blocks[1]->hash);
+  ASSERT_NE(entry_b, nullptr);
+  EXPECT_FALSE(entry_b->section_id == a_sid && entry_b->section_index == a_idx)
+      << "block B re-allocated block A's still-claimed slot (double claim)";
+
+  /* A's data is untouched. */
+  block_t* got_a = bc_get_sync(block_cache, blocks[0]->hash, pool);
+  ASSERT_NE(got_a, nullptr);
+  EXPECT_EQ(buffer_compare(got_a->data, blocks[0]->data), 0);
+  block_destroy(got_a);
+}
+
 TEST_F(TestBlockCache, TestPutGroupAbortDeletesCreatedBlocks) {
   block_cache = block_cache_create(config, location, type, timer_actor, pool, NULL, 0);
 

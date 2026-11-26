@@ -62,6 +62,33 @@ static int free_map_dealloc(free_map_t* fm, size_t index) {
   return 0;
 }
 
+int section_occupy_slot(section_t* section, size_t index) {
+  if (section == NULL || index >= section->free_map.total_blocks) {
+    return -1;
+  }
+  size_t word = index / 32;
+  size_t bit = index % 32;
+  uint32_t mask = (uint32_t)1 << bit;
+  if ((section->free_map.map[word] & mask) == 0) {
+    return 0; /* already occupied */
+  }
+  section->free_map.map[word] &= ~mask;
+  /* Mirror SECTION_DEALLOCATE's bookkeeping: dirty + persisted meta, so the
+     reconciliation survives the next crash without a re-run. */
+  atomic_store(&section->dirty, 1);
+  section_save_meta(section);
+  return 1;
+}
+
+int section_slot_occupied(section_t* section, size_t index) {
+  if (section == NULL || index >= section->free_map.total_blocks) {
+    return -1;
+  }
+  return ((section->free_map.map[index / 32] & ((uint32_t)1 << (index % 32))) == 0)
+             ? 1
+             : 0;
+}
+
 static uint8_t free_map_is_full(free_map_t* fm) {
   for (size_t word = 0; word < fm->map_capacity; word++) {
     if (fm->map[word] != 0) {

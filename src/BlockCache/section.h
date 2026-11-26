@@ -145,6 +145,16 @@ void section_dispatch(void* state, message_t* msg);
 void section_read(section_t* section, size_t index, actor_t* reply_to);
 void section_write(section_t* section, buffer_t* data, actor_t* reply_to);
 void section_deallocate(section_t* section, size_t index, actor_t* reply_to);
+/* Mark a slot occupied in the in-memory free map, persist the meta, and
+   flag dirty. Crash-recovery reconciliation (block_cache create) uses it to
+   re-occupy slots that live index entries still claim but whose "free" bit
+   survived a SIGKILL between the index and free-map flushes. Returns 1 when
+   the bit changed, 0 when it was already occupied, -1 out of range. */
+int section_occupy_slot(section_t* section, size_t index);
+
+/* Read-only: 1 when the slot is occupied (bit clear), 0 free, -1 invalid. */
+int section_slot_occupied(section_t* section, size_t index);
+
 void section_defragment(section_t* section, actor_t* reply_to);
 
 

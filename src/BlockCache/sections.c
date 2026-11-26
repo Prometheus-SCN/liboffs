@@ -237,6 +237,30 @@ static void sections_read_result_destroy(void* ptr) {
 
 /* ---- sections dispatch ---- */
 
+
+int sections_occupy_slot(sections_t* sections, size_t section_id, size_t index) {
+  if (sections == NULL) {
+    return -1;
+  }
+  section_t* section = sections_lru_cache_get(sections->lru, section_id);
+  if (section == NULL) {
+    section = section_create(sections->data_path, sections->meta_path,
+                             sections->size, section_id, sections->type,
+                             sections->pool, sections->fsync_data);
+    if (section == NULL) {
+      return -1;
+    }
+    section->on_dirty = section_on_dirty;
+    section->on_dirty_context = sections;
+    refcounter_yield((refcounter_t*) section);
+    sections_lru_cache_put(sections->lru, section);
+    if (section_full(section) == 0 && !round_robin_contains(sections->robin, section_id)) {
+      round_robin_add(sections->robin, section_id);
+    }
+  }
+  return section_occupy_slot(section, index);
+}
+
 void sections_dispatch(void* state, message_t* msg) {
   sections_t* sections = (sections_t*)state;
   platform_mutex_lock(sections->dispatch_lock);

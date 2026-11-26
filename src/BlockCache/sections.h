@@ -192,6 +192,14 @@ typedef struct {
 
 sections_t* sections_create(char* path, size_t size, size_t cache_size, size_t max_tuple_size, block_size_e type, timer_actor_t* timer_actor, scheduler_pool_t* pool, size_t wait, size_t max_wait, bool fsync_data);
 
+/* Re-occupy one slot of one section (creating the section when it is not
+   resident), for crash-recovery reconciliation: the restore of the index
+   (snapshot + WAL) and of the section free maps (meta files) are separate
+   persistence timelines, so a slot a restored index entry still claims can
+   come back marked FREE. Returns section_occupy_slot's contract (1 changed,
+   0 already occupied, -1 invalid). */
+int sections_occupy_slot(sections_t* sections, size_t section_id, size_t index);
+
 /* The block cache's capacity setting caps how far the section layer may
    grow: full sections rotate out and fresh ones open until the robin covers
    ceil(max_bytes / section_size) + 1 headroom (0 = uncapped, legacy). The

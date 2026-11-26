@@ -1402,6 +1402,49 @@ void block_cache_dispatch(void* state, message_t* msg) {
 
 /* ---- block_cache implementation ---- */
 
+/* Crash-recovery reconciliation (OFFS-275): the index (snapshot + WAL) and
+   the sections' free-map meta files are restored from independent
+   persistence timelines — a SIGKILL between their flushes leaves a slot
+   marked FREE in the recovered free map while an index entry still claims
+   it. The next write then allocated the slot to a second block, double-
+   claiming it (15 such slots found in one archived azure index). Walking
+   every live index claim here marks those slots occupied again; strictly
+   conservative — healthy free maps are untouched. */
+static void _block_cache_reconcile_slot_claims(block_cache_t* block_cache) {
+  if (block_cache->index == NULL || block_cache->sections == NULL) {
+    return;
+  }
+  if (index_count(block_cache->index) == 0) {
+    return;
+  }
+  index_entry_vec_t* entries = index_to_array(block_cache->index);
+  if (entries == NULL) {
+    return;
+  }
+  size_t reclaimed = 0;
+  for (size_t entry_idx = 0; entry_idx < entries->length; entry_idx++) {
+    index_entry_t* entry = entries->data[entry_idx];
+    if (entry == NULL || entry->hash == NULL) continue;
+    int occupied = sections_occupy_slot(block_cache->sections,
+                                        entry->section_id,
+                                        entry->section_index);
+    if (occupied > 0) {
+      reclaimed++;
+    }
+  }
+  for (size_t entry_idx = 0; entry_idx < entries->length; entry_idx++) {
+    index_entry_t* entry = entries->data[entry_idx];
+    if (entry == NULL) continue;
+    index_entry_destroy(entry);
+  }
+  vec_deinit(entries);
+  free(entries);
+  if (reclaimed > 0) {
+    log_warn("block_cache: reconciliation re-occupied %zu slots that crash recovery had left free under live index claims",
+             reclaimed);
+  }
+}
+
 block_cache_t* block_cache_create(config_t config, char* location, block_size_e type, timer_actor_t* timer_actor, scheduler_pool_t* pool, authority_t* authority, size_t max_capacity_bytes) {
   block_cache_t* block_cache = get_clear_memory(sizeof(block_cache_t));
   refcounter_init_actor((refcounter_t*) block_cache);
@@ -1464,6 +1507,7 @@ block_cache_t* block_cache_create(config_t config, char* location, block_size_e 
   if (block_cache->registry == NULL) {
     log_error("block_cache_create: ephemeral registry create failed — continuing without it");
   }
+  _block_cache_reconcile_slot_claims(block_cache);
   free(folder);
   return block_cache;
 }

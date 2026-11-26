@@ -262,6 +262,19 @@ bool actor_run(actor_t* actor, size_t batch_size) {
        sending to PRESSURED targets. Stopping processing would deadlock
        the pipeline (e.g., connection actor muted mid-request). */
   }
+  /* Release parked senders as soon as the mailbox drains below the pressure
+     threshold — the old contract only released on FULL empty, so a hot actor
+     whose inflow keeps the queue non-empty never released, and its parked
+     producers (e.g., a consumer find pipeline behind a mesh-flooded network
+     actor) never ran again for the whole transfer. pony broadcasts the
+     overload-clear unmute when pressure lifts, not only at zero. */
+  {
+    size_t pending = atomic_load(&actor->queue.size);
+    if (pending < MAILBOX_MUTE_THRESHOLD &&
+        (atomic_load(&actor->flags) & ACTOR_FLAG_PRESSURED)) {
+      backpressure_release(actor);
+    }
+  }
   if (message_queue_markempty(&actor->queue)) {
     atomic_fetch_and(&actor->flags, ~ACTOR_FLAG_SCHEDULED);
     /* Auto-release pressure when mailbox is empty. */

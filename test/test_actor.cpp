@@ -272,6 +272,50 @@ TEST(TestActor, TestMutedActorSkippedByRun) {
   actor_destroy(&actor);
 }
 
+
+/* Priority lane (OFFS-274): a priority message dispatches before queued
+ * FIFO messages. Recorded order: [priority, normal..]. */
+typedef struct ord_recorder_s {
+  int next_slot;
+  int priority_slot;   /* -1 if not seen */
+  int normal_count;
+} ord_recorder_t;
+
+TEST(TestActor, TestPriorityLaneDispatchesBeforeFifoQueue) {
+  ord_recorder_t recorder;
+  recorder.next_slot = 0;
+  recorder.priority_slot = -1;
+  recorder.normal_count = 0;
+
+  actor_t actor;
+  auto dispatch = +[](void* state, message_t* msg) {
+    auto* rec = static_cast<ord_recorder_t*>(state);
+    if (msg->type == 777) {
+      rec->priority_slot = rec->next_slot++;
+    } else {
+      rec->normal_count++;
+      rec->next_slot++;
+    }
+  };
+  actor_init(&actor, &recorder, dispatch, nullptr);
+
+  message_t msg;
+  msg.payload = nullptr;
+  msg.payload_destroy = nullptr;
+  msg.type = 1;
+  actor_send(&actor, &msg);
+  actor_send(&actor, &msg);
+  actor_send(&actor, &msg);
+  msg.type = 777;
+  actor_send_priority(&actor, &msg);
+
+  EXPECT_FALSE(actor_run(&actor, 8));
+  EXPECT_EQ(recorder.priority_slot, 0);
+  EXPECT_EQ(recorder.normal_count, 3);
+
+  actor_destroy(&actor);
+}
+
 TEST(TestActor, TestMailboxSizeTracking) {
   int count = 0;
   actor_t actor;

@@ -593,7 +593,7 @@ void readable_off_stream_dispatch(void* state, message_t* msg) {
           net_msg.type = NETWORK_LOCAL_FIND_BLOCK;
           net_msg.payload = payload;
           net_msg.payload_destroy = network_local_find_block_payload_destroy;
-          actor_send(&stream->network->actor, &net_msg);
+          actor_send_priority(&stream->network->actor, &net_msg);
         } else if (stream->load_mode) {
           /* Local-only load: the fetch's owning tuple is the one whose node
              matches; it cannot be answered — skip it. */

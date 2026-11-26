@@ -16,11 +16,21 @@ typedef struct message_node_t message_node_t;
 struct message_node_t {
   message_t msg;
   ATOMIC(message_node_t*) next;
+  /* 0 = main FIFO, 1 = priority stack. The worker frees priority-sourced
+     nodes directly after dispatch; main-queue nodes remain in the list as
+     the pop sentinel (Michael-Scott tail trick) until a later pop frees
+     them. */
+  ATOMIC(uint8_t) source;
 };
 
 typedef struct message_queue_t {
   ATOMIC(message_node_t*) head;
   message_node_t* tail;
+  /* Priority lane (consumer-critical messages jump the FIFO): a LIFO stack
+     mutated only under send_lock; the worker pops it first (taking
+     send_lock whenever it is non-empty). Single-consumer pop + locked
+     producers make the stack race-free without ABA tags. */
+  ATOMIC(message_node_t*) priority_head;
   ATOMIC(size_t) size;
   /* Optional back-pointer to the owning pool's pending-messages counter.
      When non-NULL, push increments and pop decrements it, so the pool always
@@ -61,6 +71,13 @@ void message_queue_init(message_queue_t* queue);
    destroyed (the message node AND its payload are freed by push in that
    case — the caller must NOT free them). */
 bool message_queue_push(message_queue_t* queue, message_node_t* first, message_node_t* last, bool* was_empty);
+
+/* Push onto the priority lane: the worker dispatches it before any queued
+ * main-FIFO message (only the in-progress message delays it). Same was_empty
+ * contract as push: *was_empty reports the MAIN queue's emptiness after the
+ * push so the caller injects an idle actor. size/pending accounting is
+ * shared with the main queue (backpressure semantics identical). */
+bool message_queue_push_priority(message_queue_t* queue, message_node_t* node, bool* was_empty);
 message_node_t* message_queue_pop(message_queue_t* queue);
 bool message_queue_markempty(message_queue_t* queue);
 bool message_queue_isempty(message_queue_t* queue);

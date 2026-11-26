@@ -145,7 +145,21 @@ void actor_destroy(actor_t* actor) {
   message_queue_destroy(&actor->queue);
 }
 
+static bool _actor_send_impl(actor_t* actor, message_t* msg, uint8_t priority);
+
 bool actor_send(actor_t* actor, message_t* msg) {
+  return _actor_send_impl(actor, msg, 0);
+}
+
+/* Consumer-critical sends (finds, find results): the target dispatches them
+   before any queued FIFO message. The Pony rule holds — no locks added; the
+   priority lane rides the queue's existing send_lock. */
+bool actor_send_priority(actor_t* actor, message_t* msg) {
+  return _actor_send_impl(actor, msg, 1);
+}
+
+static bool _actor_send_impl(actor_t* actor, message_t* msg, uint8_t priority) {
+  if (msg == NULL || actor == NULL) return false;
   if (atomic_load(&actor->flags) & ACTOR_FLAG_DESTROY) {
     /* Actor is being destroyed — drop the message and clean up the payload. */
     if (msg->payload_destroy != NULL && msg->payload != NULL) {
@@ -155,8 +169,11 @@ bool actor_send(actor_t* actor, message_t* msg) {
   }
   message_node_t* node = get_clear_memory(sizeof(message_node_t));
   node->msg = *msg;
+  atomic_store(&node->source, priority);
   bool was_empty_local = false;
-  bool pushed = message_queue_push(&actor->queue, node, node, &was_empty_local);
+  bool pushed = priority
+      ? message_queue_push_priority(&actor->queue, node, &was_empty_local)
+      : message_queue_push(&actor->queue, node, node, &was_empty_local);
   if (!pushed) {
     /* The queue was destroyed while we were pushing; message_queue_push
        already freed the node and the payload. */
@@ -257,6 +274,11 @@ bool actor_run(actor_t* actor, size_t batch_size) {
        (dispatch may have set msg->payload = NULL to take ownership). */
     if (node->msg.payload_destroy != NULL && node->msg.payload != NULL) {
       node->msg.payload_destroy(node->msg.payload);
+    }
+    /* Priority-sourced nodes are off-queue immediately: free them here
+       (main-queue nodes remain in the list as the pop sentinel). */
+    if (atomic_load(&node->source) == 1) {
+      free(node);
     }
     /* Muted actors still process their mailbox — muting only prevents
        sending to PRESSURED targets. Stopping processing would deadlock

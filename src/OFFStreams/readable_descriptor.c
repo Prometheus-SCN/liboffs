@@ -241,7 +241,7 @@ void readable_descriptor_dispatch(void* state, message_t* msg) {
           msg.type = NETWORK_LOCAL_FIND_BLOCK;
           msg.payload = payload;
           msg.payload_destroy = network_local_find_block_payload_destroy;
-          actor_send(&desc->network->actor, &msg);
+          actor_send_priority(&desc->network->actor, &msg);
           if (result->hash != NULL) {
             DESTROY(result->hash, buffer);
             result->hash = NULL;

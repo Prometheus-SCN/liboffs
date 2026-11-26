@@ -1054,7 +1054,7 @@ static void network_local_find_resume(network_t* network, buffer_t* hash,
           fb_msg.type = NETWORK_FIND_BLOCK_RESULT;
           fb_msg.payload = fb_result;
           fb_msg.payload_destroy = network_find_block_result_destroy;
-          actor_send(req->actor, &fb_msg);
+          actor_send_priority(req->actor, &fb_msg);
           req = req->next;
         }
         wanted_requester_list_destroy(requesters);
@@ -1087,7 +1087,7 @@ static void network_local_find_resume(network_t* network, buffer_t* hash,
           fb_msg.type = NETWORK_FIND_BLOCK_RESULT;
           fb_msg.payload = fb_result;
           fb_msg.payload_destroy = network_find_block_result_destroy;
-          actor_send(req->actor, &fb_msg);
+          actor_send_priority(req->actor, &fb_msg);
           req = req->next;
         }
         wanted_requester_list_destroy(requesters);
@@ -1177,7 +1177,7 @@ static void network_local_find_resume(network_t* network, buffer_t* hash,
             fb_msg.type = NETWORK_FIND_BLOCK_RESULT;
             fb_msg.payload = fb_result;
             fb_msg.payload_destroy = network_find_block_result_destroy;
-            actor_send(req->actor, &fb_msg);
+            actor_send_priority(req->actor, &fb_msg);
             free(req);
             req = next;
           }
@@ -2916,7 +2916,7 @@ static void network_wanted_list_timeout_cb(buffer_t* hash,
       result_msg.type = NETWORK_FIND_BLOCK_RESULT;
       result_msg.payload = result;
       result_msg.payload_destroy = network_find_block_result_destroy;
-      actor_send(req->actor, &result_msg);
+      actor_send_priority(req->actor, &result_msg);
     }
     req = req->next;
   }
@@ -5114,7 +5114,7 @@ static void network_handle_find_block_response(network_t* network, message_t* ms
             result_msg.type = NETWORK_FIND_BLOCK_RESULT;
             result_msg.payload = result;
             result_msg.payload_destroy = network_find_block_result_destroy;
-            actor_send(req->actor, &result_msg);
+            actor_send_priority(req->actor, &result_msg);
             req = req->next;
           }
           wanted_requester_list_destroy(requesters);
@@ -5202,7 +5202,7 @@ static void network_handle_find_block_response(network_t* network, message_t* ms
                   result_msg.type = NETWORK_FIND_BLOCK_RESULT;
                   result_msg.payload = result;
                   result_msg.payload_destroy = network_find_block_result_destroy;
-                  actor_send(req->actor, &result_msg);
+                  actor_send_priority(req->actor, &result_msg);
                   free(req);
                   req = next;
                 }
@@ -5507,7 +5507,7 @@ static void network_handle_store_block(network_t* network, message_t* msg) {
               result_msg.type = NETWORK_FIND_BLOCK_RESULT;
               result_msg.payload = result;
               result_msg.payload_destroy = network_find_block_result_destroy;
-              actor_send(req->actor, &result_msg);
+              actor_send_priority(req->actor, &result_msg);
               req = req->next;
             }
             wanted_requester_list_destroy(requesters);
@@ -6206,7 +6206,7 @@ static void network_handle_recall_accept(network_t* network, message_t* msg) {
           result_msg.type = NETWORK_FIND_BLOCK_RESULT;
           result_msg.payload = result;
           result_msg.payload_destroy = network_find_block_result_destroy;
-          actor_send(req->actor, &result_msg);
+          actor_send_priority(req->actor, &result_msg);
           req = req->next;
         }
         wanted_requester_list_destroy(requesters);

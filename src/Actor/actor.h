@@ -97,6 +97,12 @@ void actor_destroy(actor_t* actor);
    actor_destroy / the pool-destroy detach loop having nulled pool) is a no-op. */
 void actor_detach_pool(actor_t* actor);
 bool actor_send(actor_t* actor, message_t* msg);
+
+/* Same contract as actor_send, but the target dispatches this message before
+ * any queued FIFO message (only its in-progress message can delay it). Use
+ * for consumer-critical round trips (block finds, find results); bulk and
+ * bookkeeping traffic keeps the plain lane. */
+bool actor_send_priority(actor_t* actor, message_t* msg);
 bool actor_run(actor_t* actor, size_t batch_size);
 void backpressure_apply(actor_t* actor);
 void backpressure_release(actor_t* actor);

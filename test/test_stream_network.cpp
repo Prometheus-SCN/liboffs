@@ -213,11 +213,24 @@ TEST_F(ReadableOffStreamNetworkTest, FindBlockResultFoundReissuesCacheGet) {
   DESTROY(block, block);
   scheduler_pool_wait_for_idle(pool);
 
-  // Keep the stream from finishing on the single cache hit: the hit path
-  // calls _finish_decode_and_render once blocks_received >= blocks_expected.
-  stream->blocks_expected = 2;
-
-  // Simulate the stream being in AWAITING_NETWORK state
+  // Seed a windowed in-flight tuple owning a fetch node for `hash`: the
+  // found=1 without bytes path prunes that node and re-issues the get.
+  tuple_t* tuple_a = tuple_create(1);
+  tuple_push(tuple_a, hash);
+  inflight_tuple_t* entry = static_cast<inflight_tuple_t*>(get_clear_memory(sizeof(inflight_tuple_t)));
+  entry->tuple = (tuple_t*)refcounter_reference((refcounter_t*)tuple_a);
+  entry->ordinal = 0;
+  entry->blocks_expected = 2;
+  entry->blocks_received = 0;
+  pending_block_fetch_t* node = static_cast<pending_block_fetch_t*>(get_clear_memory(sizeof(pending_block_fetch_t)));
+  node->hash = (buffer_t*)refcounter_reference((refcounter_t*)hash);
+  node->index = 0;
+  node->next = NULL;
+  entry->pending_fetches = node;
+  entry->next = NULL;
+  stream->inflight_head = entry;
+  stream->inflight_tail = entry;
+  stream->inflight_count = 1;
   stream->state = OFF_STREAM_AWAITING_NETWORK;
 
   // Craft and dispatch NETWORK_FIND_BLOCK_RESULT with found=1.
@@ -242,17 +255,17 @@ TEST_F(ReadableOffStreamNetworkTest, FindBlockResultFoundReissuesCacheGet) {
   // Verify: state should transition back to FETCHING_BLOCKS
   EXPECT_EQ(stream->state, OFF_STREAM_FETCHING_BLOCKS);
 
-  // The cache-hit path allocated xor_accumulator (a copy of the block data);
-  // readable_off_stream_destroy does not free it, so clean it up here to
-  // avoid leaking across the test.
-  if (stream->xor_accumulator != NULL) {
-    DESTROY(stream->xor_accumulator, buffer);
-    stream->xor_accumulator = NULL;
-  }
+  // The re-issued get was answered (cache hit): its node pruned and the
+  // block folded into the entry's accumulator (blocks_received 1 < expected
+  // 2 → no completion). Inflight state is freed by the fixture's destroy.
+  EXPECT_EQ(entry->pending_fetches, nullptr);
+  EXPECT_EQ(entry->blocks_received, 1);
+  EXPECT_NE(entry->xor_accumulator, nullptr);
 
   // Clean up our references (result.hash holds a reference we need to release)
   DESTROY(result.hash, buffer);
   DESTROY(hash, buffer);
+  tuple_destroy(tuple_a);
 }
 
 // Test: NETWORK_FIND_BLOCK_RESULT with found=1 and block != NULL uses the
@@ -276,14 +289,28 @@ TEST_F(ReadableOffStreamNetworkTest, FindBlockResultDirectReturnUsesBlockDirectl
   // accumulator and blocks_received before the stream completes). The
   // direct path does not transition state, so seed AWAITING_NETWORK and
   // confirm it stays put (a local-refetch path would set FETCHING_BLOCKS).
-  stream->blocks_expected = 2;
-  stream->blocks_received = 0;
   stream->state = OFF_STREAM_AWAITING_NETWORK;
-  // Ensure no accumulator carried over from a prior dispatch.
-  if (stream->xor_accumulator != NULL) {
-    DESTROY(stream->xor_accumulator, buffer);
-    stream->xor_accumulator = NULL;
+
+  // Seed an in-flight tuple with an ordinal-0 entry and no fetch node: the
+  // degenerate result (no hash, block attached) accumulates into the oldest
+  // in-flight tuple — the pre-window contract.
+  tuple_t* tuple_b = tuple_create(1);
+  {
+    uint8_t placeholder_bytes[32];
+    memset(placeholder_bytes, 0x5A, sizeof(placeholder_bytes));
+    buffer_t* placeholder = buffer_create_from_pointer_copy(placeholder_bytes, 32);
+    tuple_push(tuple_b, placeholder);
+    buffer_destroy(placeholder);
   }
+  inflight_tuple_t* entry = static_cast<inflight_tuple_t*>(get_clear_memory(sizeof(inflight_tuple_t)));
+  entry->tuple = (tuple_t*)refcounter_reference((refcounter_t*)tuple_b);
+  entry->ordinal = 0;
+  entry->blocks_expected = 2;
+  entry->blocks_received = 0;
+  entry->next = NULL;
+  stream->inflight_head = entry;
+  stream->inflight_tail = entry;
+  stream->inflight_count = 1;
 
   // Craft and dispatch NETWORK_FIND_BLOCK_RESULT with found=1 and block != NULL.
   network_find_block_result_payload_t result;
@@ -299,17 +326,17 @@ TEST_F(ReadableOffStreamNetworkTest, FindBlockResultDirectReturnUsesBlockDirectl
 
   readable_off_stream_dispatch(stream, &msg);
 
-  // Verify: the block was used directly — the XOR accumulator is a copy of
-  // the block's data (no cache re-fetch occurred).
-  ASSERT_NE(stream->xor_accumulator, nullptr);
+  // Verify: the block was used directly — the entry's XOR accumulator is a
+  // copy of the block's data (no cache re-fetch occurred).
+  ASSERT_NE(entry->xor_accumulator, nullptr);
   ASSERT_NE(block->data, nullptr);
-  EXPECT_EQ(stream->xor_accumulator->size, block->data->size);
-  EXPECT_EQ(memcmp(stream->xor_accumulator->data,
+  EXPECT_EQ(entry->xor_accumulator->size, block->data->size);
+  EXPECT_EQ(memcmp(entry->xor_accumulator->data,
                    block->data->data,
                    block->data->size), 0);
 
   // Verify: blocks_received advanced — the direct-return branch was taken.
-  EXPECT_EQ(stream->blocks_received, 1);
+  EXPECT_EQ(entry->blocks_received, 1);
 
   // Verify: state was NOT transitioned to FETCHING_BLOCKS. The direct path
   // does not re-fetch from the cache; the local-refetch path (block == NULL)
@@ -323,12 +350,7 @@ TEST_F(ReadableOffStreamNetworkTest, FindBlockResultDirectReturnUsesBlockDirectl
   DESTROY(result.block, block);
   DESTROY(block, block);
 
-  // The accumulator is allocated by the handler but readable_off_stream_destroy
-  // does not free it; clean it up here to avoid leaking across the test.
-  if (stream->xor_accumulator != NULL) {
-    DESTROY(stream->xor_accumulator, buffer);
-    stream->xor_accumulator = NULL;
-  }
+  // The entry's accumulator is freed by readable_off_stream_destroy (fixture).
 }
 
 // Test: NETWORK_FIND_BLOCK_RESULT with found=0 deactivates the stream
@@ -339,14 +361,22 @@ TEST_F(ReadableOffStreamNetworkTest, FindBlockResultNotFoundDeactivates) {
                           0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99};
   buffer_t* hash = make_hash(hash_data, 32);
 
-  // Set up a pending tuple so the deactivate code can clean it up
-  tuple_t* pending = tuple_create(3);
+  // Seed an in-flight tuple (get-mode) — the found=0 path deactivates the
+  // stream; teardown clears the in-flight list.
+  tuple_t* pending = tuple_create(1);
   buffer_t* h1 = make_hash(hash_data, 32);
   tuple_push(pending, h1);
-  stream->pending_tuple = REFERENCE(pending, tuple_t);
   DESTROY(h1, buffer);
-
-  // Simulate the stream being in AWAITING_NETWORK state
+  inflight_tuple_t* entry = static_cast<inflight_tuple_t*>(
+      get_clear_memory(sizeof(inflight_tuple_t)));
+  entry->tuple = static_cast<tuple_t*>(refcounter_reference((refcounter_t*)pending));
+  entry->ordinal = 0;
+  entry->blocks_expected = 3;
+  entry->blocks_received = 0;
+  entry->next = NULL;
+  stream->inflight_head = entry;
+  stream->inflight_tail = entry;
+  stream->inflight_count = 1;
   stream->state = OFF_STREAM_AWAITING_NETWORK;
 
   // Craft and dispatch NETWORK_FIND_BLOCK_RESULT with found=0
@@ -365,13 +395,10 @@ TEST_F(ReadableOffStreamNetworkTest, FindBlockResultNotFoundDeactivates) {
   // Verify: stream should be deactivated (stream_deactivate sets this immediately)
   EXPECT_EQ(stream->stream.is_deactivated, 1);
 
-  // Verify: pending_fetch_hash no longer used (hash comes from result payload)
-
   // Clean up our references
   DESTROY(result.hash, buffer);
   DESTROY(hash, buffer);
-  // pending still holds a reference (REFERENCE incremented refcount to 2,
-  // then dispatch handler's DESTROY decremented it to 1)
+  // entry holds its own reference on pending; destroy (decrement) ours
   tuple_destroy(pending);
 }
 
@@ -401,12 +428,22 @@ TEST_F(ReadableOffStreamNetworkTest, LocalOnlyDeactivatesOnCacheMiss) {
                           0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99};
   buffer_t* hash = make_hash(hash_data, 32);
 
-  // Set up a pending tuple for cleanup
-  tuple_t* pending = tuple_create(3);
+  // Seed an in-flight tuple for the miss path (get-mode miss deactivates;
+  // teardown clears the in-flight list)
+  tuple_t* pending = tuple_create(1);
   buffer_t* h1 = make_hash(hash_data, 32);
   tuple_push(pending, h1);
-  local_stream->pending_tuple = REFERENCE(pending, tuple_t);
   DESTROY(h1, buffer);
+  inflight_tuple_t* entry = static_cast<inflight_tuple_t*>(
+      get_clear_memory(sizeof(inflight_tuple_t)));
+  entry->tuple = static_cast<tuple_t*>(refcounter_reference((refcounter_t*)pending));
+  entry->ordinal = 0;
+  entry->blocks_expected = 3;
+  entry->blocks_received = 0;
+  entry->next = NULL;
+  local_stream->inflight_head = entry;
+  local_stream->inflight_tail = entry;
+  local_stream->inflight_count = 1;
 
   // Simulate CACHE_GET_RESULT with block=NULL (cache miss)
   cache_get_result_payload_t cache_result;
@@ -443,16 +480,28 @@ TEST_F(ReadableOffStreamNetworkTest, NetworkFetchOnCacheMiss) {
                           0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99};
   buffer_t* hash = make_hash(hash_data, 32);
 
-  // Set up a pending tuple for the cache miss path
-  tuple_t* pending = tuple_create(3);
+  // Seed an in-flight tuple whose fetch is issued directly on the entry: the
+  // miss routes the find.
+  tuple_t* pending = tuple_create(1);
   buffer_t* h1 = make_hash(hash_data, 32);
   tuple_push(pending, h1);
-  stream->pending_tuple = REFERENCE(pending, tuple_t);
   DESTROY(h1, buffer);
-
-  // Set up blocks_expected/blocks_received state
-  stream->blocks_expected = 1;
-  stream->blocks_received = 0;
+  inflight_tuple_t* entry = static_cast<inflight_tuple_t*>(
+      get_clear_memory(sizeof(inflight_tuple_t)));
+  entry->tuple = static_cast<tuple_t*>(refcounter_reference((refcounter_t*)pending));
+  entry->ordinal = 0;
+  entry->blocks_expected = 1;
+  entry->blocks_received = 0;
+  pending_block_fetch_t* node = static_cast<pending_block_fetch_t*>(
+      get_clear_memory(sizeof(pending_block_fetch_t)));
+  node->hash = static_cast<buffer_t*>(refcounter_reference((refcounter_t*)hash));
+  node->index = 0;
+  node->next = NULL;
+  entry->pending_fetches = node;
+  entry->next = NULL;
+  stream->inflight_head = entry;
+  stream->inflight_tail = entry;
+  stream->inflight_count = 1;
 
   // Simulate CACHE_GET_RESULT with block=NULL (cache miss) — the stream has network
   cache_get_result_payload_t cache_result;

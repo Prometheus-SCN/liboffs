@@ -36,6 +36,33 @@ typedef struct pending_tuple_t {
   struct pending_tuple_t* next;
 } pending_tuple_t;
 
+/* Concurrent tuple fetch window (OFFS-274): find round trips dominate the
+   consumer path (~100ms per tuple serialized), so up to READ_STREAM_FETCH_
+   WINDOW tuples may have lookups + block fetches in flight simultaneously.
+   Completed tuples park in the in-flight FIFO until the render drain reaches
+   them in stream order — renders (and sent_bytes accounting) stay strictly
+   ordered for every transport. */
+/* Window depth: 16 tuples ≈ 48 outstanding finds. Find round trips are
+   sub-second; the remaining ceiling is the network actor's shared mailbox
+   (mesh bookkeeping interleaves with consumer finds), not this window. */
+#define READ_STREAM_FETCH_WINDOW 16
+
+/* One tuple between arrival and render. Held in an ordinal-ordered in-flight
+   FIFO (append on start, pop from head at render). */
+typedef struct inflight_tuple_t {
+  struct inflight_tuple_t* next;
+  tuple_t* tuple;                     /* reference owned by this entry */
+  size_t ordinal;                     /* write-order sequence */
+  uint8_t in_lookup;                  /* tuple_cache_get outstanding */
+  uint8_t completed;                  /* decoded; parked for in-order render */
+  buffer_t* encoded_data;             /* decoded payload awaiting render turn */
+  buffer_t* xor_accumulator;          /* block data received so far */
+  size_t blocks_expected;
+  size_t blocks_received;
+  pending_block_fetch_t* pending_fetches;   /* unanswered hashes of this tuple */
+  pending_block_fetch_t* presatisfied;      /* raced results parked pre-fetch */
+} inflight_tuple_t;
+
 /* Progress payload for load_tuple_event (load mode only). Refcounted: the
  * notify machinery holds references while dispatching, so handlers should
  * copy the two counters out or take their own reference. */
@@ -66,25 +93,20 @@ typedef struct {
   uint8_t closed;                   /* 1 = close_event already notified (render or request_close) */
   size_t tuples_loaded;             /* tuples whose data was served / rendered */
   size_t tuples_skipped;            /* tuples abandoned because blocks were missing */
-  off_stream_state_e state;         /* stream state */
-  /* Async decode state */
-  tuple_t* pending_tuple;
-  buffer_t* xor_accumulator;
-  size_t blocks_expected;
-  size_t blocks_received;
-  pending_block_fetch_t* pending_fetches;
-  /* Hashes of an already-skipped tuple that are STRICTLY UNANSWERED (answered
-   * fetches are pruned from pending_fetches as their results are consumed, see
-   * readable_off_stream.c): late results matching these are dropped so they
-   * cannot corrupt the live tuple's XOR accumulator. */
+  off_stream_state_e state;         /* coarse stream state (diagnostic) */
+  /* Windowed in-flight tuples, FIFO by ordinal: head = oldest (next to
+     render), tail = newest. Completed entries park in place until the render
+     drain reaches them in order. */
+  inflight_tuple_t* inflight_head;
+  inflight_tuple_t* inflight_tail;
+  size_t inflight_count;
+  size_t next_ordinal;              /* ordinal for the next started tuple */
+  /* Hashes of already-skipped tuples that are STRICTLY UNANSWERED (answered
+     fetches are pruned as their results are consumed, see
+     readable_off_stream.c): late results matching these are dropped so they
+     cannot pollute any in-flight tuple's XOR accumulator. */
   pending_block_fetch_t* stale_fetches;
-  /* Results for the live tuple that arrive BEFORE its fetches are issued (the
-     tuple is being readied: pending_tuple set, but block_cache_get/find are
-     only sent from the tuple-cache callback). Each is parked here keyed by
-     hash; _start_block_fetches skips re-issuing satisfied hashes and counts
-     them in. */
-  pending_block_fetch_t* presatisfied_fetches;
-  /* Queue of tuples waiting to be processed */
+  /* Queue of tuples waiting for a window slot */
   pending_tuple_t* tuple_queue;
 } readable_off_stream_t;
 

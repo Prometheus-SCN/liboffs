@@ -13,7 +13,12 @@
 #include <stdbool.h>
 
 // FindBlock constants from Network Design spec
-#define FIND_BLOCK_FORWARD_FANOUT 3
+/* Find fanout: hops a single FindBlock forwards to. Measured (window-64
+   e2e, norelay13 fleet): 3-hop fanout pulled 799 duplicate 128KB block
+   replies for 246 needed — a 3.2x wire multiplication that saturated the
+   requester's inbound link ~10s instead of ~3s. 2 keeps one redundant
+   path for liveness while halving the duplicate block traffic. */
+#define FIND_BLOCK_FORWARD_FANOUT 2
 #define FIND_BLOCK_MAX_PATH 6
 #define FIND_BLOCK_MAX_VISITED_BLOOM 256  // bytes = 2048 bits
 #define FIND_BLOCK_MIN_WEIGHT 0.01f

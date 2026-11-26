@@ -42,10 +42,13 @@ typedef struct pending_tuple_t {
    Completed tuples park in the in-flight FIFO until the render drain reaches
    them in stream order — renders (and sent_bytes accounting) stay strictly
    ordered for every transport. */
-/* Window depth: 16 tuples ≈ 48 outstanding finds. Find round trips are
-   sub-second; the remaining ceiling is the network actor's shared mailbox
-   (mesh bookkeeping interleaves with consumer finds), not this window. */
-#define READ_STREAM_FETCH_WINDOW 16
+/* Window depth: find round trips are ~50-70ms and the transfer is
+   RTT-pipelined, so depth scales throughput nearly linearly until the wire
+   or the holder rate-limit saturates. 64 tuples ≈ 192 outstanding finds ≈
+   one transfer's full tuple count; per-in-flight memory is ~4KB (state +
+   one 32B hash per node) plus parked 128KB accumulators for completed
+   tuples awaiting their render turn — bounded by the FIFO's ordinal order. */
+#define READ_STREAM_FETCH_WINDOW 64
 
 /* One tuple between arrival and render. Held in an ordinal-ordered in-flight
    FIFO (append on start, pop from head at render). */

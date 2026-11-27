@@ -1469,6 +1469,9 @@ static void handle_command(int client_fd, char* line) {
           existing->relay_endpoint_id = relay_endpoint_id;
           conn_state_set_peer_nat_type(existing, NAT_TYPE_SYMMETRIC);
         }
+        /* Same reachable-via-relay assertion as the add path (OFFS-271). */
+        existing->connected = true;
+        existing->connected_at_ms = (int64_t)time(NULL) * 1000;
         send_response(client_fd, CTRL_RESP_OK);
       } else {
         peer_connection_t* peer = connection_manager_add(&g_node.network->conn_mgr, &peer_id, NULL, g_node.pool);
@@ -1477,6 +1480,15 @@ static void handle_command(int client_fd, char* line) {
             peer->relay_endpoint_id = relay_endpoint_id;
             conn_state_set_peer_nat_type(peer, NAT_TYPE_SYMMETRIC);
           }
+          /* The fixture asserts this peer is reachable through the relay —
+             that IS the proven send path for a relay-routed topology (the
+             test-harness analog of the relay-routed-contact flip in
+             network.c RELAY_RECEIVED). Without it, a3daee9's connected-
+             false-at-creation leaves the peer gossip- and route-invisible
+             forever: nothing else will ever prove a path to an entity that
+             exists only as test bookkeeping. OFFS-271. */
+          peer->connected = true;
+          peer->connected_at_ms = (int64_t)time(NULL) * 1000;
           // Ensure the peer is in the ring set for routing
           net_node_t* ring_node = net_node_create(&peer_id, 0, 0);
           if (ring_node != NULL) {
